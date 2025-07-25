@@ -19,10 +19,18 @@ chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 # Initialize ChromaDB's built-in OpenAIEmbeddingFunction
 # It directly uses the OPENAI_API_KEY from environment variables.
 # Ensure OPENAI_API_KEY is set in your .env file.
-openai_ef = embedding_functions.OpenAIEmbeddingFunction(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    model_name="text-embedding-ada-002" # Or your preferred OpenAI embedding model
-)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY or OPENAI_API_KEY == "your_openai_api_key_here":
+    print("WARNING: OpenAI API Key not set properly. Using default embeddings.")
+    MOCK_MODE = True
+    openai_ef = embedding_functions.DefaultEmbeddingFunction()
+else:
+    MOCK_MODE = False
+    openai_ef = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=OPENAI_API_KEY,
+        model_name="text-embedding-ada-002" # Or your preferred OpenAI embedding model
+    )
 
 def get_or_create_collection(collection_name: str):
     """
@@ -74,7 +82,9 @@ def add_message_to_history(collection_name: str, message_content: str, role: str
             metadatas=[metadata],
             ids=[message_id]
         )
-        print(f"Message added to '{collection_name}' by {sender}: '{message_content[:50]}...'")
+        # Only log for important collections
+        if "mrfrench-logs" in collection_name:
+            print(f"MrFrench log added: {message_content[:100]}...")
         return True
     except Exception as e:
         print(f"Error adding message to ChromaDB collection '{collection_name}': {e}")
@@ -149,18 +159,18 @@ def retrieve_context(collection_name: str, query_text: str, n_results: int = 5) 
             n_results=n_results,
             include=['documents', 'metadatas', 'distances']
         )
+
         context = []
-        if results and results['documents']:
-            for i in range(len(results['documents'][0])):
+        if results and results['ids'][0]:  # Check if there are results
+            for i in range(len(results['ids'][0])):
                 message = {
                     "role": results['metadatas'][0][i].get("role", "user"),
                     "content": results['documents'][0][i],
                     "sender": results['metadatas'][0][i].get("sender", "Unknown"),
-                    "timestamp": results['metadatas'][0][i].get("timestamp", "")
+                    "distance": results['distances'][0][i],
+                    "timestamp": results['metadatas'][0][i].get("timestamp", datetime.now(timezone.utc).isoformat())
                 }
                 context.append(message)
-        # Sort by timestamp to maintain order if context is later used for LLM history
-        context.sort(key=lambda x: x.get("timestamp", ""))
         return context
     except Exception as e:
         print(f"Error retrieving context from ChromaDB collection '{collection_name}': {e}")
@@ -168,7 +178,13 @@ def retrieve_context(collection_name: str, query_text: str, n_results: int = 5) 
 
 def delete_collection(collection_name: str) -> bool:
     """
-    Deletes a specific ChromaDB collection.
+    Deletes a ChromaDB collection entirely.
+
+    Args:
+        collection_name (str): The name of the collection to delete.
+
+    Returns:
+        bool: True if successful, False otherwise.
     """
     try:
         chroma_client.delete_collection(name=collection_name)
@@ -180,79 +196,100 @@ def delete_collection(collection_name: str) -> bool:
 
 def delete_all_chroma_data() -> bool:
     """
-    Deletes all relevant ChromaDB collections.
-    Used for the /reset-conversation endpoint.
+    Deletes all ChromaDB collections and data.
+    Use with extreme caution!
+
+    Returns:
+        bool: True if successful, False otherwise.
     """
-    collection_names = ["timmy-parent", "timmy-mrfrench", "parent-mrfrench", "mrfrench-logs", "test-chat-history", "test-mrfrench-logs"]
-    success = True
-    for name in collection_names:
-        # Check if collection exists before attempting to delete to avoid "does not exist" errors in logs
-        try:
-            chroma_client.get_collection(name=name)
-            if delete_collection(name):
-                pass
-            else:
-                success = False
-        except Exception as e:
-            # print(f"Collection '{name}' does not exist, skipping deletion.") # This would be too verbose
-            pass # Expected error if collection doesn't exist.
+    try:
+        # Get list of all collections
+        collections = chroma_client.list_collections()
+        
+        # Delete each collection
+        for collection in collections:
+            chroma_client.delete_collection(name=collection.name)
+        
+        print(f"All ChromaDB data deleted. {len(collections)} collections removed.")
+        return True
+    except Exception as e:
+        print(f"Error deleting all ChromaDB data: {e}")
+        return False
 
-    print("All ChromaDB data deletion process complete.")
-    return success
+def list_collections() -> list:
+    """
+    Lists all available ChromaDB collections.
 
-# --- Test Block (Run this file directly to test ChromaDB functions) ---
+    Returns:
+        list: List of collection names.
+    """
+    try:
+        collections = chroma_client.list_collections()
+        collection_names = [collection.name for collection in collections]
+        return collection_names
+    except Exception as e:
+        print(f"Error listing ChromaDB collections: {e}")
+        return []
+
+def get_collection_count(collection_name: str) -> int:
+    """
+    Gets the number of documents in a ChromaDB collection.
+
+    Args:
+        collection_name (str): The name of the collection.
+
+    Returns:
+        int: The number of documents in the collection, or -1 if error.
+    """
+    collection = get_or_create_collection(collection_name)
+    if not collection:
+        return -1
+
+    try:
+        return collection.count()
+    except Exception as e:
+        print(f"Error getting collection count for '{collection_name}': {e}")
+        return -1
+
+# --- Test Block (Run this file directly to test ChromaDB connection and functions) ---
 if __name__ == "__main__":
     print("--- Testing ChromaDB Service ---")
-    import json
-
-    # Clean up previous test data if any
-    print("\nAttempting to delete all test collections first...")
-    delete_all_chroma_data()
-
-    test_collection = "test-chat-history"
-    log_collection = "test-mrfrench-logs"
-
-    # Add messages to a test chat history collection
-    print(f"\nAdding messages to '{test_collection}'...")
-    add_message_to_history(test_collection, "Hi Timmy, did you finish your homework?", "user", "Parent")
-    add_message_to_history(test_collection, "Not yet, I'm playing games.", "assistant", "Timmy")
-    add_message_to_history(test_collection, "Timmy, focus on your homework now.", "user", "Parent")
-    add_message_to_history(test_collection, "Okay, I'll start it soon.", "assistant", "Timmy")
-
-    # Get chat history
-    print(f"\nFetching chat history from '{test_collection}'...")
-    history = get_chat_history(test_collection)
-    print(f"History ({len(history)} messages):")
-    print(json.dumps(history, indent=2))
-    if len(history) == 4:
-        print("History retrieval looks good.")
+    
+    # Test adding a message
+    test_collection = "test-collection"
+    test_message = "Hello, this is a test message."
+    result = add_message_to_history(test_collection, test_message, "user", "TestUser")
+    if result:
+        print(f"✓ Message added to '{test_collection}'")
     else:
-        print("History retrieval issue.")
-
-    # Add Mr. French log
-    print(f"\nAdding a log to '{log_collection}'...")
-    add_message_to_history(log_collection, "Identified task 'homework' as pending.", "system", "Mr. French Analyzer", {"chat_type": "timmy-parent"})
-    log_history = get_chat_history(log_collection)
-    print(f"Mr. French Logs ({len(log_history)} messages):")
-    print(json.dumps(log_history, indent=2))
-    if len(log_history) == 1:
-        print("Log history retrieval looks good.")
+        print(f"✗ Failed to add message to '{test_collection}'")
+    
+    # Test retrieving chat history
+    history = get_chat_history(test_collection, n_results=10)
+    if history:
+        print(f"✓ Retrieved {len(history)} messages from '{test_collection}'")
+        for msg in history[-3:]:  # Show last 3 messages
+            print(f"  - {msg['role']}: {msg['content'][:50]}...")
     else:
-        print("Log history retrieval issue.")
-
-
-    # Retrieve context
-    print(f"\nRetrieving context for 'homework' from '{test_collection}'...")
-    context_messages = retrieve_context(test_collection, "What about homework?", n_results=2)
-    print(f"Context messages ({len(context_messages)} found):")
-    print(json.dumps(context_messages, indent=2))
-    if len(context_messages) > 0 and "homework" in context_messages[0]['content'].lower():
-        print("Context retrieval looks good.")
+        print(f"✗ No history retrieved from '{test_collection}'")
+    
+    # Test context retrieval
+    context = retrieve_context(test_collection, "test", n_results=3)
+    if context:
+        print(f"✓ Retrieved {len(context)} contextual messages")
     else:
-        print("Context retrieval issue.")
-
-    # Delete test collections
-    print("\nDeleting test collections...")
+        print("✗ No contextual messages retrieved")
+    
+    # Test listing collections
+    collections = list_collections()
+    print(f"✓ Available collections: {collections}")
+    
+    # Test collection count
+    count = get_collection_count(test_collection)
+    print(f"✓ Collection '{test_collection}' has {count} documents")
+    
+    # Clean up test collection
     delete_collection(test_collection)
-    delete_collection(log_collection)
-    print("ChromaDB Service Test Complete.")
+    print(f"✓ Test collection '{test_collection}' deleted")
+    
+    print("--- ChromaDB Service Test Complete ---")

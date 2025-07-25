@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Assuming these are in your project structure
 from conversation_flow import app as langgraph_app # Your compiled LangGraph app
-from supabase_service import get_tasks, add_task, delete_all_tasks, update_task # Ensure update_task is imported
+from supabase_service import get_tasks, add_task, delete_all_tasks, update_task, get_timmy_zone, update_timmy_zone # Ensure update_task is imported
 from chroma_service import add_message_to_history, get_chat_history, delete_all_chroma_data, delete_collection
 
 app = FastAPI()
@@ -26,18 +26,38 @@ class ChatInput(BaseModel):
 class TimmyZoneUpdate(BaseModel):
     zone: str
 
-def determine_roles(chat_type: str, user_type: str) -> tuple:
+def is_placeholder_message(content: str) -> bool:
     """
-    Returns a tuple (user_role, ai_role) based on chat_type and user_type
+    Check if a message is just a placeholder (e.g., "Parent", "Mr. French", "Timmy")
     """
-    if chat_type == "timmy-mrfrench":
-        return "Timmy", "Mr. French"
-    elif chat_type == "parent-mrfrench":
-        return "Parent", "Mr. French"
-    elif chat_type == "parent-timmy":
-        return "Parent", "Timmy"
-    else:
-        return user_type, "Mr. French"
+    if not content or not content.strip():
+        return True
+    
+    placeholder_texts = ["Parent", "Mr. French", "Timmy"]
+    return content.strip() in placeholder_texts
+
+def filter_placeholder_messages(history: list) -> list:
+    """
+    Filter out placeholder messages from chat history
+    """
+    return [msg for msg in history if not is_placeholder_message(msg.get("content", ""))]
+
+def analyze_timmy_zone(tasks: list) -> str:
+    """
+    Analyze Timmy's performance and determine appropriate zone based on task count and status
+    """
+    if not tasks:
+        return "Green"  # No tasks, default to Green
+    
+    pending_tasks = [task for task in tasks if task.get("is_completed") == "Pending"]
+    overdue_tasks = [task for task in tasks if task.get("is_completed") == "Pending" and task.get("Due_Date") == "Today"]
+    
+    # Red Zone: 5 or more pending tasks OR 3 or more overdue tasks
+    if len(pending_tasks) >= 5 or len(overdue_tasks) >= 3:
+        return "Red"
+    
+    # Green Zone: Normal performance (few pending tasks)
+    return "Green"
 
 # Define an endpoint for the home page or health check
 @app.get("/")
@@ -62,6 +82,16 @@ async def chat_endpoint(
 
     if chat_type not in ["parent-timmy", "parent-mrfrench", "timmy-mrfrench"]:
         raise HTTPException(status_code=400, detail="Invalid chat_type. Must be 'parent-timmy', 'parent-mrfrench', or 'timmy-mrfrench'.")
+
+    # Skip processing if input is just a placeholder
+    if is_placeholder_message(user_input):
+        logger.info(f"Skipping placeholder message: '{user_input}'")
+        return {
+            "user_type": user_type,
+            "user_input": user_input,
+            "ai_response": "",
+            "message": "Placeholder message ignored"
+        }
 
     # Set current_speaker based on user_type
     current_speaker = user_type
@@ -106,8 +136,6 @@ async def chat_endpoint(
                 logger.warning("No assistant message found in child_turn node.")
         
         if final_state.get("mrfrench_analysis", {}).get("mr_french_analysis"):
-            logger.info(f"Mr. French Analysis: {final_state['mrfrench_analysis']['mr_french_analysis']}")
-            logger.info(f"Mr. French Task Action Response: {final_state['mrfrench_analysis']['mr_french_task_action_response']}")
             analysis = final_state["mrfrench_analysis"]["mr_french_analysis"]
             if analysis.get("intent") == "UPDATE_TASK":
                 original_task_name = analysis.get("original_task_name")
@@ -116,24 +144,23 @@ async def chat_endpoint(
                     try:
                         logger.info(f"Attempting to update task '{original_task_name}' to 'Completed' in Supabase.")
                         updated_task_db_response = update_task(original_task_name, updates)
-                        logger.info(f"Supabase update_task response: {updated_task_db_response}")
                         if not updated_task_db_response:
                             logger.error(f"Failed to find or update task '{original_task_name}' in Supabase.")
                     except Exception as db_e:
                         logger.error(f"Error during Supabase task update for '{original_task_name}': {db_e}", exc_info=True)
 
-        # Save the conversation to DB (add this before the return statement)
+        # Auto-analyze and update Timmy's zone after each conversation
         try:
-            user_role, ai_role = determine_roles(chat_type, user_type)
-
-            add_message_to_history(chat_type, user_input, user_role, user_type)
-            add_message_to_history(chat_type, response_message, ai_role, ai_role)
-
-
-        except Exception as save_e:
-            logger.error(f"Failed to save chat history: {save_e}", exc_info=True)
-
-
+            all_tasks = get_tasks()
+            suggested_zone = analyze_timmy_zone(all_tasks)
+            current_zone = get_timmy_zone()
+            
+            # Only auto-update to Red or Green zones (never auto-set Blue)
+            if suggested_zone != current_zone and suggested_zone in ["Red", "Green"]:
+                update_timmy_zone(suggested_zone)
+                logger.info(f"Auto-updated Timmy's zone from {current_zone} to {suggested_zone}")
+        except Exception as zone_e:
+            logger.error(f"Error during zone analysis: {zone_e}")
 
         return {
             "user_type": user_type,
@@ -152,13 +179,15 @@ async def chat_endpoint(
 @app.get("/chat/{chat_type}/history")
 async def get_chat_history_endpoint(chat_type: str):
     """
-    Retrieves the full message history for a given chat type.
+    Retrieves the full message history for a given chat type, filtered to remove placeholder messages.
     """
-    if chat_type not in ["parent-timmy", "parent-mrfrench", "timmy-mrfrench", "mrfrench-logs"]:
-        raise HTTPException(status_code=400, detail="Invalid chat_type. Must be 'parent-timmy', 'parent-mrfrench', 'timmy-mrfrench', or 'mrfrench-logs'.")
+    if chat_type not in ["parent-timmy", "parent-mrfrench", "timmy-mrfrench"]:
+        raise HTTPException(status_code=400, detail="Invalid chat_type. Must be 'parent-timmy', 'parent-mrfrench', or 'timmy-mrfrench'.")
     
     history = get_chat_history(chat_type, n_results=100)
-    return {"chat_type": chat_type, "history": history}
+    # Filter out placeholder messages
+    filtered_history = filter_placeholder_messages(history)
+    return {"chat_type": chat_type, "history": filtered_history}
 
 # --- Control & Monitoring Endpoints ---
 
@@ -177,49 +206,65 @@ async def reset_conversation():
         logger.error(f"Failed to reset conversation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to reset conversation: {e}")
 
-@app.get("/mrfrench-logs")
-async def get_mrfrench_logs_endpoint():
+@app.get("/mrfrench-logs/{log_type}")
+async def get_mrfrench_logs_endpoint(log_type: str):
     """
-    Retrieves all logs from the mrfrench-logs ChromaDB collection.
+    Retrieves MrFrench logs for a specific chat type.
     """
+    valid_log_types = ["parent-timmy", "parent-mrfrench", "timmy-mrfrench"]
+    if log_type not in valid_log_types:
+        raise HTTPException(status_code=400, detail=f"Invalid log_type. Must be one of {valid_log_types}.")
+    
     try:
-        logs = get_chat_history("mrfrench-logs", n_results=200) # Fetch more for logs
-        return {"mrfrench_logs": logs}
+        logs = get_chat_history(f"mrfrench-logs-{log_type}", n_results=200)
+        return {"log_type": log_type, "mrfrench_logs": logs}
     except Exception as e:
-        logger.error(f"Failed to retrieve Mr. French logs: {e}", exc_info=True)
+        logger.error(f"Failed to retrieve Mr. French logs for {log_type}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to retrieve Mr. French logs: {e}")
 
 @app.get("/timmy-zone")
 async def get_timmy_zone_endpoint():
     """
     Retrieves Timmy's current zone.
-    (Placeholder - actual zone storage and retrieval logic needs to be implemented)
     """
-    logger.info("Request to get Timmy's zone (placeholder).")
-    # This is a placeholder. You'll need actual logic to store and retrieve Timmy's zone.
-    # Example: return {"zone": get_timmy_zone_from_db()}
-    return {"zone": "Green", "message": "Timmy zone retrieval logic needs full implementation."}
+    try:
+        zone = get_timmy_zone()
+        all_tasks = get_tasks()
+        suggested_zone = analyze_timmy_zone(all_tasks)
+        
+        return {
+            "zone": zone,
+            "suggested_zone": suggested_zone,
+            "zone_analysis": {
+                "total_tasks": len(all_tasks),
+                "pending_tasks": len([t for t in all_tasks if t.get("is_completed") == "Pending"]),
+                "completed_tasks": len([t for t in all_tasks if t.get("is_completed") == "Completed"]),
+                "overdue_tasks": len([t for t in all_tasks if t.get("is_completed") == "Pending" and t.get("Due_Date") == "Today"])
+            }
+        }
+    except Exception as e:
+        logger.error(f"Failed to retrieve Timmy's zone: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve Timmy's zone: {e}")
 
 @app.post("/timmy-zone")
 async def update_timmy_zone_endpoint(zone_update: TimmyZoneUpdate):
     """
-    Updates Timmy's zone. Requires Parent's permission for Red Zone.
-    (Placeholder - actual zone storage and update logic needs to be implemented)
+    Updates Timmy's zone. Blue Zone can only be set by Parent manually.
     """
     zone = zone_update.zone
     if not zone or zone not in ["Red", "Green", "Blue"]:
         raise HTTPException(status_code=400, detail="Invalid zone. Must be 'Red', 'Green', or 'Blue'.")
 
-    logger.info(f"Request to update Timmy's zone to '{zone}' (placeholder).")
-    # Placeholder for actual zone update logic and permission handling
-    # You will need to integrate this with MrFrenchAgent's permission flow for Red Zone
-    # and actual DB storage for Timmy's zone.
-    if zone == "Red":
-        # Simulate asking for permission, which would happen in a conversational flow
-        return {"message": f"Request to set Timmy's zone to {zone} received. Parent permission for Red Zone required in conversational flow (this endpoint is for direct updates by system, not conversational setting)."}
-    
-    # Simulate direct update for Green/Blue
-    return {"message": f"Timmy's zone set to {zone} (placeholder update). Actual DB update logic pending."}
+    try:
+        result = update_timmy_zone(zone)
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+            
+        logger.info(f"Timmy's zone updated to: {zone}")
+        return {"message": f"Timmy's zone has been set to {zone}.", "zone": zone}
+    except Exception as e:
+        logger.error(f"Failed to update Timmy's zone: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to update Timmy's zone: {e}")
 
 
 @app.get("/tasks")
