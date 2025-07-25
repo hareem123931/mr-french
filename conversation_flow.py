@@ -76,17 +76,38 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
 
     all_tasks = get_tasks() 
     pending_tasks = [task for task in all_tasks if task.get("is_completed") == "Pending"]
+    progress_tasks = [task for task in all_tasks if task.get("is_completed") == "Progress"]
+    completed_tasks = [task for task in all_tasks if task.get("is_completed") == "Completed"]
 
     tasks_context = ""
-    if pending_tasks:
-        tasks_context = "\n\nCurrently Pending Tasks (for context, do not respond about these unless user's input refers to them for update/deletion):"
-        for task in pending_tasks:
-            tasks_context += f"\n- Task: {task.get('task')}, Status: {task.get('is_completed')}, Due: {task.get('Due_Date')} {task.get('Due_Time')}"
+    if all_tasks:
+        tasks_context = "\n\nCurrent Tasks in Database:"
+        if pending_tasks:
+            tasks_context += f"\nPending Tasks ({len(pending_tasks)}):"
+            for task in pending_tasks:
+                tasks_context += f"\n- Task: {task.get('task')}, Status: {task.get('is_completed')}, Due: {task.get('Due_Date')} {task.get('Due_Time')}"
+        if progress_tasks:
+            tasks_context += f"\nIn Progress Tasks ({len(progress_tasks)}):"
+            for task in progress_tasks:
+                tasks_context += f"\n- Task: {task.get('task')}, Status: {task.get('is_completed')}, Due: {task.get('Due_Date')} {task.get('Due_Time')}"
+        if completed_tasks:
+            tasks_context += f"\nCompleted Tasks ({len(completed_tasks)}):"
+            for task in completed_tasks:
+                tasks_context += f"\n- Task: {task.get('task')}, Status: {task.get('is_completed')}, Due: {task.get('Due_Date')} {task.get('Due_Time')}"
+    else:
+        tasks_context = "\n\nNo tasks found in the database."
 
     analysis_prompt = SystemMessage(
         content=f"""You are Mr. French, a sophisticated AI assistant.
-        Your primary role is to analyze user messages for task-related intents (ADD_TASK, UPDATE_TASK, DELETE_TASK) or general conversation (NO_TASK_IDENTIFIED).
-        You also need to identify 'Timmy Zone' related requests (SET_TIMMY_ZONE_RED, SET_TIMMY_ZONE_BLUE).
+        Your primary role is to analyze user messages for task-related intents and actions.
+        
+        **Intent Categories:**
+        1. ADD_TASK - Instructions or commands to do something
+        2. UPDATE_TASK - Updates to existing tasks (including completion)
+        3. DELETE_TASK - Remove/cancel tasks
+        4. TASK_INQUIRY - Questions about task status, progress, or updates
+        5. SET_TIMMY_ZONE_RED / SET_TIMMY_ZONE_BLUE - Zone setting requests
+        6. NO_TASK_IDENTIFIED - General conversation
 
         **Task Intent Recognition Details:**
         - For ADD_TASK: Look for ANY instruction, command, or request that tells someone to do something. This includes:
@@ -100,6 +121,16 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
         
         - For DELETE_TASK: Identify 'task' (name to delete) when someone says to cancel, remove, or forget about a task.
         
+        - For TASK_INQUIRY: Detect questions about tasks, progress, updates, or status. Look for phrases like:
+          * "What's the update on Timmy's tasks?"
+          * "How is Timmy's progress?"
+          * "What tasks does Timmy have?"
+          * "Show me completed tasks"
+          * "What's pending?"
+          * "Any updates on homework?"
+          Set 'query_type' to 'all', 'pending', 'progress', 'completed', or 'specific' (if asking about a specific task)
+          If asking about a specific task, set 'specific_task' to the task name.
+        
         - For SET_TIMMY_ZONE_RED or SET_TIMMY_ZONE_BLUE: Identify the 'zone' ('Red' or 'Blue').
 
         **Response Format:**
@@ -107,10 +138,11 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
 
         **Examples:**
         - ADD_TASK: {{"intent": "ADD_TASK", "task": "Watch a sports match", "is_completed": "Pending", "Due_Date": "Today", "Due_Time": "Unknown", "Reward": "None"}}
-        - ADD_TASK: {{"intent": "ADD_TASK", "task": "Clean your room", "is_completed": "Pending", "Due_Date": "Today", "Due_Time": "Evening", "Reward": "None"}}
         - UPDATE_TASK (completion): {{"intent": "UPDATE_TASK", "original_task_name": "Watch F1 movie", "updates": {{"is_completed": "Completed"}}}}
-        - UPDATE_TASK (other update): {{"intent": "UPDATE_TASK", "original_task_name": "Do homework", "updates": {{"Due_Date": "Tomorrow"}}}}
         - DELETE_TASK: {{"intent": "DELETE_TASK", "task": "Take out the trash"}}
+        - TASK_INQUIRY (all): {{"intent": "TASK_INQUIRY", "query_type": "all"}}
+        - TASK_INQUIRY (specific): {{"intent": "TASK_INQUIRY", "query_type": "specific", "specific_task": "homework"}}
+        - TASK_INQUIRY (by status): {{"intent": "TASK_INQUIRY", "query_type": "pending"}}
         - SET_TIMMY_ZONE_RED: {{"intent": "SET_TIMMY_ZONE_RED", "zone": "Red"}}
         - NO_TASK_IDENTIFIED: {{"intent": "NO_TASK_IDENTIFIED"}}
 
@@ -147,7 +179,6 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
                 )
                 add_message_to_history("timmy-mrfrench", "Mr. French", "Mr. French", timmy_notification_msg)
 
-
         elif intent == "UPDATE_TASK":
             original_task_name = mr_french_analysis.get("original_task_name")
             updates = mr_french_analysis.get("updates")
@@ -168,6 +199,32 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
                 task_action_response = f"I've removed the task: '{task_name}'."
             else:
                 task_action_response = "I couldn't identify which task to delete."
+
+        elif intent == "TASK_INQUIRY":
+            query_type = mr_french_analysis.get("query_type", "all")
+            specific_task = mr_french_analysis.get("specific_task", "")
+            
+            # Fetch current task data for response
+            all_tasks = get_tasks()
+            
+            if query_type == "pending":
+                relevant_tasks = [task for task in all_tasks if task.get("is_completed") == "Pending"]
+                task_action_response = f"Found {len(relevant_tasks)} pending tasks."
+            elif query_type == "progress":
+                relevant_tasks = [task for task in all_tasks if task.get("is_completed") == "Progress"]
+                task_action_response = f"Found {len(relevant_tasks)} tasks in progress."
+            elif query_type == "completed":
+                relevant_tasks = [task for task in all_tasks if task.get("is_completed") == "Completed"]
+                task_action_response = f"Found {len(relevant_tasks)} completed tasks."
+            elif query_type == "specific" and specific_task:
+                relevant_tasks = [task for task in all_tasks if specific_task.lower() in task.get("task", "").lower()]
+                task_action_response = f"Found {len(relevant_tasks)} tasks matching '{specific_task}'."
+            else:
+                relevant_tasks = all_tasks
+                task_action_response = f"Found {len(all_tasks)} total tasks."
+            
+            # Store task data for response formatting
+            state["mr_french_analysis"]["task_inquiry_data"] = relevant_tasks
 
         elif intent in ["SET_TIMMY_ZONE_RED", "SET_TIMMY_ZONE_BLUE"]:
             zone = mr_french_analysis.get("zone")
@@ -256,6 +313,7 @@ def mrfrench_response_node(state: AgentState) -> AgentState:
         Respond to the parent in a helpful, concise, and polite manner.
         Acknowledge their requests clearly. If a task action (add/update/delete) was performed, confirm it professionally.
         If it's a general query, respond appropriately without mentioning tasks unless relevant.
+        When providing task information, format it clearly and helpfully.
         Avoid bullet points unless explicitly asked for a list. Keep messages concise, like a natural conversation."""
         recipient = "Parent"
     elif chat_type == "timmy-mrfrench":
@@ -272,7 +330,56 @@ def mrfrench_response_node(state: AgentState) -> AgentState:
     
     messages_for_llm = [mrfrench_system_prompt] + full_context_for_mrfrench
     
-    if mr_french_analysis.get("intent") in ["ADD_TASK", "UPDATE_TASK", "DELETE_TASK"]:
+    # Handle task inquiries with detailed responses
+    if mr_french_analysis.get("intent") == "TASK_INQUIRY":
+        query_type = mr_french_analysis.get("query_type", "all")
+        specific_task = mr_french_analysis.get("specific_task", "")
+        task_inquiry_data = state["mr_french_analysis"].get("task_inquiry_data", [])
+        
+        # Format task data for response
+        if task_inquiry_data:
+            task_details = ""
+            for task in task_inquiry_data:
+                task_name = task.get("task", "Unknown task")
+                status = task.get("is_completed", "Unknown status")
+                due_date = task.get("Due_Date", "No due date")
+                due_time = task.get("Due_Time", "No due time")
+                reward = task.get("Reward", "No reward")
+                
+                task_details += f"\n- {task_name} (Status: {status}"
+                if due_date != "No due date" and due_date != "None":
+                    task_details += f", Due: {due_date}"
+                    if due_time != "No due time" and due_time != "None" and due_time != "Unknown":
+                        task_details += f" at {due_time}"
+                if reward != "No reward" and reward != "None":
+                    task_details += f", Reward: {reward}"
+                task_details += ")"
+            
+            if query_type == "all":
+                instruction_message = f"The parent asked about all of Timmy's tasks. Provide a helpful summary. Here are the current tasks: {task_details}\n\nRespond naturally and conversationally, organizing this information in a parent-friendly way."
+            elif query_type == "pending":
+                instruction_message = f"The parent asked about Timmy's pending tasks. Here are the {len(task_inquiry_data)} pending tasks: {task_details}\n\nRespond naturally, focusing on what still needs to be done."
+            elif query_type == "progress":
+                instruction_message = f"The parent asked about Timmy's tasks in progress. Here are the {len(task_inquiry_data)} tasks currently in progress: {task_details}\n\nRespond naturally, focusing on ongoing work."
+            elif query_type == "completed":
+                instruction_message = f"The parent asked about Timmy's completed tasks. Here are the {len(task_inquiry_data)} completed tasks: {task_details}\n\nRespond naturally, focusing on accomplishments."
+            elif query_type == "specific" and specific_task:
+                instruction_message = f"The parent asked about tasks related to '{specific_task}'. Here are the {len(task_inquiry_data)} matching tasks: {task_details}\n\nRespond naturally about these specific tasks."
+            else:
+                instruction_message = f"The parent asked about tasks. Here are the relevant tasks: {task_details}\n\nRespond naturally and helpfully."
+        else:
+            if query_type == "pending":
+                instruction_message = "The parent asked about pending tasks, but there are no pending tasks currently. Respond positively about this."
+            elif query_type == "progress":
+                instruction_message = "The parent asked about tasks in progress, but there are no tasks currently in progress. Respond appropriately."
+            elif query_type == "completed":
+                instruction_message = "The parent asked about completed tasks, but there are no completed tasks yet. Respond encouragingly."
+            elif query_type == "specific" and specific_task:
+                instruction_message = f"The parent asked about tasks related to '{specific_task}', but no matching tasks were found. Respond helpfully."
+            else:
+                instruction_message = "The parent asked about tasks, but there are currently no tasks in the system. Respond helpfully."
+                
+    elif mr_french_analysis.get("intent") in ["ADD_TASK", "UPDATE_TASK", "DELETE_TASK"]:
         instruction_message = f"You just analyzed the message and detected a task action. Your internal action response was: '{mr_french_task_action_response}'. Formulate a natural, conversational response based on this action and the user's original message: '{user_input}'."
     elif mr_french_analysis.get("intent") in ["SET_TIMMY_ZONE_RED", "SET_TIMMY_ZONE_BLUE"]:
         instruction_message = f"You just analyzed a request to set Timmy's zone. Your internal action response was: '{mr_french_task_action_response}'. Formulate a response regarding Timmy's zone."

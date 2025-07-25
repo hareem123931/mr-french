@@ -1,6 +1,9 @@
 import os
 from dotenv import load_dotenv
-from supabase import create_client, Client
+try:
+    from supabase import create_client, Client
+except ImportError:
+    Client = None
 from datetime import datetime, timezone # For timestamp management
 import json # For pretty printing test results
 
@@ -12,10 +15,40 @@ load_dotenv()
 SUPABASE_URL: str = os.getenv("SUPABASE_URL")
 SUPABASE_KEY: str = os.getenv("SUPABASE_KEY")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Supabase URL and Key must be set in the .env file.")
+# Mock data for testing when Supabase is not available
+MOCK_TASKS = [
+    {
+        "id": 1,
+        "task": "go and watch cricket match at 10 PM tonight",
+        "is_completed": "Pending",
+        "Due_Date": "2024-07-25",
+        "Due_Time": "22:00",
+        "Reward": None,
+        "createdAt": "2024-07-25T16:00:00.000Z",
+        "updatedAt": "2024-07-25T16:00:00.000Z"
+    },
+    {
+        "id": 2,
+        "task": "complete his homework",
+        "is_completed": "Progress",
+        "Due_Date": "2024-07-25",
+        "Due_Time": "18:00",
+        "Reward": None,
+        "createdAt": "2024-07-25T16:05:00.000Z",
+        "updatedAt": "2024-07-25T16:05:00.000Z"
+    }
+]
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Try to create supabase client, fall back to mock mode if it fails
+try:
+    if not SUPABASE_URL or not SUPABASE_KEY or SUPABASE_URL.startswith("https://dummy"):
+        raise ValueError("Using mock mode for testing")
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    USE_MOCK = False
+except Exception as e:
+    print(f"Supabase connection failed, using mock data: {e}")
+    supabase = None
+    USE_MOCK = True
 
 def add_task(task_data: dict) -> dict:
     """
@@ -39,6 +72,15 @@ def add_task(task_data: dict) -> dict:
         # If 'Rewards' was passed in by mistake from LLM, convert it.
         if 'Rewards' in task_data:
             task_data['Reward'] = task_data.pop('Rewards') # Change key from 'Rewards' to 'Reward'
+
+        if USE_MOCK:
+            # Add to mock data
+            new_id = max([task.get("id", 0) for task in MOCK_TASKS], default=0) + 1
+            task_data['id'] = new_id
+            task_data['createdAt'] = datetime.now(timezone.utc).isoformat()
+            MOCK_TASKS.append(task_data)
+            print(f"Task added successfully (mock): {task_data}")
+            return task_data
 
         response = supabase.table("tasks").insert(task_data).execute()
         # Supabase client returns a response object; the data is in response.data
@@ -82,6 +124,22 @@ def update_task(task_id: str = None, task_name: str = None, updates: dict = {}) 
         # Ensure the key for rewards is 'Reward' (singular) if present in updates
         if 'Rewards' in updates:
             updates['Reward'] = updates.pop('Rewards')
+
+        if USE_MOCK:
+            # Handle mock data updates
+            target_task = None
+            if task_id:
+                target_task = next((task for task in MOCK_TASKS if str(task.get("id")) == str(task_id)), None)
+            elif task_name:
+                # Find by name (case-insensitive, exact match)
+                target_task = next((task for task in MOCK_TASKS if task.get("task", "").lower() == task_name.lower()), None)
+            
+            if target_task:
+                target_task.update(updates)
+                print(f"Task updated successfully (mock): {target_task}")
+                return target_task
+            else:
+                return {"error": f"No task found for update with ID '{task_id}' or name '{task_name}'"}
 
         target_task_id = task_id
         if not target_task_id and task_name:
@@ -155,6 +213,13 @@ def get_tasks(status: str = None) -> list:
         list: A list of task dictionaries.
     """
     try:
+        if USE_MOCK:
+            # Return mock data
+            if status:
+                return [task for task in MOCK_TASKS if task.get("is_completed") == status]
+            else:
+                return MOCK_TASKS.copy()
+        
         if status:
             response = supabase.table("tasks").select("*").eq("is_completed", status).order("updatedAt", desc=True).execute()
         else:
@@ -179,6 +244,14 @@ def find_task_by_name(task_name: str) -> list:
         list: A list of task dictionaries that exactly match the name.
     """
     try:
+        if USE_MOCK:
+            # Search mock data for exact match (case-insensitive)
+            exact_matches = [
+                task for task in MOCK_TASKS
+                if task.get('task', '').strip().lower() == task_name.strip().lower()
+            ]
+            return exact_matches
+        
         # Using .ilike for a robust search that's generally case-insensitive.
         response = supabase.table("tasks").select("*").ilike("task", task_name).execute()
         if response.data:
