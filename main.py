@@ -125,10 +125,21 @@ async def chat_endpoint(
         # Save the conversation to DB (add this before the return statement)
         try:
             user_role, ai_role = determine_roles(chat_type, user_type)
-
             add_message_to_history(chat_type, user_input, user_role, user_type)
-            add_message_to_history(chat_type, response_message, ai_role, ai_role)
 
+            # Only add AI response if it was actually generated (not for parent-timmy)
+            if chat_type != "parent-timmy" and response_message and response_message != "No direct AI response generated for this chat type.":
+                add_message_to_history(chat_type, response_message, ai_role, ai_role)
+
+            # Add MrFrench logs for parent-timmy (observer mode)
+            if chat_type == "parent-timmy":
+                mrfrench_analysis = final_state.get("mr_french_analysis", {}).get("mr_french_analysis")
+                log_content = f"Parent message: {user_input}"
+                log_metadata = {"role": "observer", "sender": "Mr. French", "source": "parent-timmy"}
+                if mrfrench_analysis:
+                    import json
+                    log_metadata["analysis"] = json.dumps(mrfrench_analysis)
+                add_message_to_history("mrfrench-logs-parent-timmy", log_content, "observer", "Mr. French", log_metadata)
 
         except Exception as save_e:
             logger.error(f"Failed to save chat history: {save_e}", exc_info=True)
@@ -180,11 +191,25 @@ async def reset_conversation():
 @app.get("/mrfrench-logs")
 async def get_mrfrench_logs_endpoint():
     """
-    Retrieves all logs from the mrfrench-logs ChromaDB collection.
+    Retrieves all logs from all MrFrench log collections.
     """
     try:
-        logs = get_chat_history("mrfrench-logs", n_results=200) # Fetch more for logs
-        return {"mrfrench_logs": logs}
+        # Aggregate logs from all relevant collections
+        collections = [
+            "mrfrench-logs",
+            "mrfrench-logs-parent-timmy",
+            "mrfrench-logs-parent-mrfrench",
+            "mrfrench-logs-timmy-mrfrench"
+        ]
+        all_logs = []
+        for col in collections:
+            logs = get_chat_history(col, n_results=200)
+            for log in logs:
+                log["collection"] = col
+            all_logs.extend(logs)
+        # Sort all logs by timestamp if present
+        all_logs.sort(key=lambda x: x.get("timestamp", ""))
+        return {"mrfrench_logs": all_logs}
     except Exception as e:
         logger.error(f"Failed to retrieve Mr. French logs: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to retrieve Mr. French logs: {e}")
