@@ -7,24 +7,31 @@ import json
 import logging
 from fastapi import Path
 
+from llm_service import MR_FRENCH_OBSERVER_PROMPT, get_llm_response
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Assuming these are in your project structure
 from conversation_flow import app as langgraph_app # Your compiled LangGraph app
-from supabase_service import get_tasks, add_task, delete_all_tasks, update_task # Ensure update_task is imported
+from supabase_service import delete_task, get_tasks, add_task, delete_all_tasks, update_task, get_timmy_zone, update_timmy_zone # Ensure update_task is imported
 from chroma_service import add_message_to_history, get_chat_history, delete_all_chroma_data, delete_collection
+import reminder_scheduler  # This will start the scheduler when the app runs
 
 app = FastAPI()
 
 # Pydantic models for request bodies
 class ChatInput(BaseModel):
     user_input: str
-    user_type: str # 'Parent' or 'Timmy'
+    user_type: str  # 'Parent' or 'Timmy'
 
 class TimmyZoneUpdate(BaseModel):
     zone: str
+
+class ParentTimmyMessage(BaseModel):
+    sender: str  # "Parent" or "Timmy"
+    message: str
 
 def determine_roles(chat_type: str, user_type: str) -> tuple:
     """
@@ -48,14 +55,14 @@ async def read_root():
 
 @app.post("/chat/{chat_type}")
 async def chat_endpoint(
-    chat_type: str = Path(..., regex="^(parent-timmy|parent-mrfrench|timmy-mrfrench)$"),
-    chat_input: ChatInput = ...
+    chat_input: ChatInput,
+    chat_type: str = Path(..., regex="^(parent-timmy|parent-mrfrench|timmy-mrfrench)$")
 ):
     """
     Handles conversational input for different chat types based on chat_type path parameter.
     """
     user_input = chat_input.user_input
-    user_type = chat_input.user_type.capitalize() # Ensure 'Parent' or 'Timmy'
+    user_type = chat_input.user_type.capitalize()  # Ensure 'Parent' or 'Timmy'
 
     if user_type not in ["Parent", "Timmy"]:
         raise HTTPException(status_code=400, detail="Invalid user_type. Must be 'Parent' or 'Timmy'.")
@@ -88,65 +95,134 @@ async def chat_endpoint(
 
         response_message = "No direct AI response generated for this chat type."
         
-        if "mrfrench_response" in final_state:
-            messages_list = final_state["mrfrench_response"].get("messages", [])
-            assistant_messages = [msg["content"] for msg in messages_list if msg.get("role") == "assistant"]
-            if assistant_messages:
-                response_message = assistant_messages[-1]
-                logger.info(f"Mr. French Response: {response_message}")
-            else:
-                logger.warning("No assistant message found in mrfrench_response node.")
-        elif "child_turn" in final_state:
-            messages_list = final_state["child_turn"].get("messages", [])
-            assistant_messages = [msg["content"] for msg in messages_list if msg.get("role") == "assistant"]
-            if assistant_messages:
-                response_message = assistant_messages[-1]
-                logger.info(f"Timmy Response: {response_message}")
-            else:
-                logger.warning("No assistant message found in child_turn node.")
-        
-        if final_state.get("mrfrench_analysis", {}).get("mr_french_analysis"):
-            logger.info(f"Mr. French Analysis: {final_state['mrfrench_analysis']['mr_french_analysis']}")
-            logger.info(f"Mr. French Task Action Response: {final_state['mrfrench_analysis']['mr_french_task_action_response']}")
-            analysis = final_state["mrfrench_analysis"]["mr_french_analysis"]
-            if analysis.get("intent") == "UPDATE_TASK":
-                original_task_name = analysis.get("original_task_name")
-                updates = analysis.get("updates")
-                if original_task_name and updates and updates.get("is_completed") == "Completed":
-                    try:
-                        logger.info(f"Attempting to update task '{original_task_name}' to 'Completed' in Supabase.")
-                        updated_task_db_response = update_task(original_task_name, updates)
-                        logger.info(f"Supabase update_task response: {updated_task_db_response}")
-                        if not updated_task_db_response:
-                            logger.error(f"Failed to find or update task '{original_task_name}' in Supabase.")
-                    except Exception as db_e:
-                        logger.error(f"Error during Supabase task update for '{original_task_name}': {db_e}", exc_info=True)
-
-        # Save the conversation to DB (add this before the return statement)
-        try:
-            user_role, ai_role = determine_roles(chat_type, user_type)
-
-            add_message_to_history(chat_type, user_input, user_role, user_type)
-            add_message_to_history(chat_type, response_message, ai_role, ai_role)
-
-
-        except Exception as save_e:
-            logger.error(f"Failed to save chat history: {save_e}", exc_info=True)
-
-
-
-        return {
-            "user_type": user_type,
-            "user_input": user_input,
-            "ai_response": response_message,
-            "final_state_summary": {
-                k: v for k, v in final_state.items() if k not in ["messages"]
+        if chat_type == "parent-timmy":
+            # Always expect Timmy's response in child_turn
+            if "child_turn" in final_state:
+                messages_list = final_state["child_turn"].get("messages", [])
+                assistant_messages = [msg["content"] for msg in messages_list if msg.get("role") == "assistant"]
+                if assistant_messages:
+                    response_message = assistant_messages[-1]
+                    logger.info(f"Timmy Response: {response_message}")
+                else:
+                    logger.warning("No assistant message found in child_turn node.")
+            # Save to ChromaDB
+            try:
+                add_message_to_history(chat_type, user_input, "user", "Parent")
+                add_message_to_history(chat_type, response_message, "assistant", "Timmy")
+            except Exception as save_e:
+                logger.error(f"Failed to save chat history: {save_e}", exc_info=True)
+            # Return API contract
+            return {"sender": "Timmy", "message": response_message}
+        else:
+            # Legacy behavior for other chat types
+            if "mrfrench_response" in final_state:
+                messages_list = final_state["mrfrench_response"].get("messages", [])
+                assistant_messages = [msg["content"] for msg in messages_list if msg.get("role") == "assistant"]
+                if assistant_messages:
+                    response_message = assistant_messages[-1]
+                    logger.info(f"Mr. French Response: {response_message}")
+                else:
+                    logger.warning("No assistant message found in mrfrench_response node.")
+            elif "child_turn" in final_state:
+                messages_list = final_state["child_turn"].get("messages", [])
+                assistant_messages = [msg["content"] for msg in messages_list if msg.get("role") == "assistant"]
+                if assistant_messages:
+                    response_message = assistant_messages[-1]
+                    logger.info(f"Timmy Response: {response_message}")
+                else:
+                    logger.warning("No assistant message found in child_turn node.")
+            if final_state.get("mrfrench_analysis", {}).get("mr_french_analysis"):
+                logger.info(f"Mr. French Analysis: {final_state['mrfrench_analysis']['mr_french_analysis']}")
+                logger.info(f"Mr. French Task Action Response: {final_state['mrfrench_analysis']['mr_french_task_action_response']}")
+                analysis = final_state["mrfrench_analysis"]["mr_french_analysis"]
+                if analysis.get("intent") == "UPDATE_TASK":
+                    original_task_name = analysis.get("original_task_name")
+                    updates = analysis.get("updates")
+                    if original_task_name and updates and updates.get("is_completed") == "Completed":
+                        try:
+                            logger.info(f"Attempting to update task '{original_task_name}' to 'Completed' in Supabase.")
+                            updated_task_db_response = update_task(original_task_name, updates)
+                            logger.info(f"Supabase update_task response: {updated_task_db_response}")
+                            if not updated_task_db_response:
+                                logger.error(f"Failed to find or update task '{original_task_name}' in Supabase.")
+                        except Exception as db_e:
+                            logger.error(f"Error during Supabase task update for '{original_task_name}': {db_e}", exc_info=True)
+            try:
+                user_role, ai_role = determine_roles(chat_type, user_type)
+                add_message_to_history(chat_type, user_input, user_role, user_type)
+                add_message_to_history(chat_type, response_message, ai_role, ai_role)
+            except Exception as save_e:
+                logger.error(f"Failed to save chat history: {save_e}", exc_info=True)
+            return {
+                "user_type": user_type,
+                "user_input": user_input,
+                "ai_response": response_message,
+                "final_state_summary": {
+                    k: v for k, v in final_state.items() if k not in ["messages"]
+                }
             }
-        }
-
     except Exception as e:
         logger.error(f"Error during chat processing: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error during chat processing: {e}")
+
+# --- Parent-Timmy Message Endpoint ---
+
+@app.post("/parent-timmy/message")
+async def parent_timmy_message(msg: ParentTimmyMessage):
+    if msg.sender not in ["Parent", "Timmy"]:
+        raise HTTPException(status_code=400, detail="Sender must be 'Parent' or 'Timmy'.")
+
+    add_message_to_history("parent-timmy", msg.message, "user", msg.sender)
+
+    # Build context: last 10 from DB + all current session (here, just the current message)
+    current_session_messages = [{"role": "user", "content": msg.message}]
+    context_messages = build_llm_context("parent-timmy", current_session_messages, n_history=10)
+
+    # Prepare prompt as before
+    pending_tasks = get_tasks(status="Pending")
+    pending_tasks_str = "\n".join([f"- {t['task']}" for t in pending_tasks]) if pending_tasks else "None"
+    observer_prompt = MR_FRENCH_OBSERVER_PROMPT.replace("{pending_tasks}", pending_tasks_str)
+
+    analysis_raw = get_llm_response(
+        observer_prompt,
+        context_messages,
+        model="gpt-4",
+        temperature=0.0
+    )
+
+    try:
+        analysis = json.loads(analysis_raw)
+    except Exception:
+        analysis = {"intent": "NO_TASK"}
+
+    mrfrench_action = analysis.get("intent", "NO_TASK")
+
+    # Only keep valid columns for the tasks table
+    allowed_keys = {"task", "is_completed", "Due_Date", "Due_Time", "Reward"}
+    if mrfrench_action == "ADD_TASK":
+        task_data = {k: v for k, v in analysis.items() if k in allowed_keys}
+        add_task(task_data)
+    elif mrfrench_action == "UPDATE_TASK":
+        # Fuzzy match the task name
+        from supabase_service import find_similar_task
+        original_task_name = analysis.get("original_task_name")
+        updates = analysis.get("updates", {})
+        matched_task = find_similar_task(original_task_name)
+        if matched_task:
+            update_task(task_id=matched_task["id"], updates=updates)
+    elif mrfrench_action == "DELETE_TASK":
+        from supabase_service import find_similar_task
+        original_task_name = analysis.get("original_task_name") or analysis.get("task")
+        matched_task = find_similar_task(original_task_name)
+        if matched_task:
+            delete_task(task_id=matched_task["id"])
+
+    return {
+        "status": "ok",
+        "message_saved": True,
+        "mrfrench_action": mrfrench_action,
+        "mrfrench_analysis": analysis
+    }
 
 # --- Chat History Endpoint ---
 @app.get("/chat/{chat_type}/history")
@@ -156,8 +232,11 @@ async def get_chat_history_endpoint(chat_type: str):
     """
     if chat_type not in ["parent-timmy", "parent-mrfrench", "timmy-mrfrench", "mrfrench-logs"]:
         raise HTTPException(status_code=400, detail="Invalid chat_type. Must be 'parent-timmy', 'parent-mrfrench', 'timmy-mrfrench', or 'mrfrench-logs'.")
-    
     history = get_chat_history(chat_type, n_results=100)
+    if chat_type == "parent-timmy":
+        # Return as list of {"sender", "message"}
+        return [{"sender": msg.get("sender", "Unknown"), "message": msg.get("content", "")}
+                for msg in get_chat_history(chat_type, n_results=100)]
     return {"chat_type": chat_type, "history": history}
 
 # --- Control & Monitoring Endpoints ---
@@ -196,9 +275,8 @@ async def get_timmy_zone_endpoint():
     (Placeholder - actual zone storage and retrieval logic needs to be implemented)
     """
     logger.info("Request to get Timmy's zone (placeholder).")
-    # This is a placeholder. You'll need actual logic to store and retrieve Timmy's zone.
-    # Example: return {"zone": get_timmy_zone_from_db()}
-    return {"zone": "Green", "message": "Timmy zone retrieval logic needs full implementation."}
+    zone = get_timmy_zone()
+    return {"zone": zone}
 
 @app.post("/timmy-zone")
 async def update_timmy_zone_endpoint(zone_update: TimmyZoneUpdate):
@@ -211,16 +289,10 @@ async def update_timmy_zone_endpoint(zone_update: TimmyZoneUpdate):
         raise HTTPException(status_code=400, detail="Invalid zone. Must be 'Red', 'Green', or 'Blue'.")
 
     logger.info(f"Request to update Timmy's zone to '{zone}' (placeholder).")
-    # Placeholder for actual zone update logic and permission handling
-    # You will need to integrate this with MrFrenchAgent's permission flow for Red Zone
-    # and actual DB storage for Timmy's zone.
-    if zone == "Red":
-        # Simulate asking for permission, which would happen in a conversational flow
-        return {"message": f"Request to set Timmy's zone to {zone} received. Parent permission for Red Zone required in conversational flow (this endpoint is for direct updates by system, not conversational setting)."}
-    
-    # Simulate direct update for Green/Blue
-    return {"message": f"Timmy's zone set to {zone} (placeholder update). Actual DB update logic pending."}
-
+    result = update_timmy_zone(zone_update.zone)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"zone": result.get("zone", zone_update.zone)}
 
 @app.get("/tasks")
 async def get_tasks_endpoint(status: Optional[str] = None):
@@ -234,6 +306,41 @@ async def get_tasks_endpoint(status: Optional[str] = None):
     except Exception as e:
         logger.error(f"Failed to retrieve tasks: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to retrieve tasks: {e}")
+
+@app.get("/logs/{chat_type}")
+async def get_logs_endpoint(chat_type: str):
+    """
+    Retrieves logs for a specific chat type.
+    """
+    if chat_type not in ["parent-timmy", "parent-mrfrench", "timmy-mrfrench"]:
+        raise HTTPException(status_code=400, detail="Invalid chat_type. Must be 'parent-timmy', 'parent-mrfrench', or 'timmy-mrfrench'.")
+    
+    logger.info(f"Request to retrieve logs for chat type: {chat_type}")
+    log_collection = f"mrfrench-logs-{chat_type}"
+    logs = get_chat_history(log_collection, n_results=200)
+    return {"logs": logs}
+
+def build_llm_context(chat_type: str, current_session_messages: list, n_history: int = 10) -> list:
+    """
+    Returns a list of messages for LLM context:
+    - Last n_history messages from DB
+    - All current session messages (not just last 10)
+    Maps roles to OpenAI-compatible values.
+    """
+    db_history = get_chat_history(chat_type, n_results=n_history)
+    # Map roles for OpenAI
+    def map_role(msg):
+        role = msg.get("role", "user")
+        if role not in ["system", "assistant", "user"]:
+            # Map sender to role if needed
+            sender = msg.get("sender", "").lower()
+            if sender == "mr. french":
+                return {"role": "assistant", "content": msg["content"]}
+            else:
+                return {"role": "user", "content": msg["content"]}
+        return {"role": role, "content": msg["content"]}
+    context = [map_role(msg) for msg in db_history + current_session_messages]
+    return context
 
 if __name__ == "__main__":
     uvicorn.run(app, port=8000)

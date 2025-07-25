@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from datetime import datetime, timezone # For timestamp management
 import json # For pretty printing test results
+import difflib
 
 # Load environment variables from .env file
 load_dotenv()
@@ -13,9 +14,25 @@ SUPABASE_URL: str = os.getenv("SUPABASE_URL")
 SUPABASE_KEY: str = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Supabase URL and Key must be set in the .env file.")
+    print("WARNING: Supabase URL and Key not set in .env file. Running in mock mode.")
+    MOCK_MODE = True
+    supabase = None
+else:
+    MOCK_MODE = False
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+def find_similar_task(task_name: str, threshold: float = 0.8) -> dict:
+    """
+    Returns the most similar existing task if above threshold, else None.
+    """
+    all_tasks = get_tasks()
+    task_names = [t['task'] for t in all_tasks]
+    matches = difflib.get_close_matches(task_name.lower(), [n.lower() for n in task_names], n=1, cutoff=threshold)
+    if matches:
+        for t in all_tasks:
+            if t['task'].lower() == matches[0]:
+                return t
+    return None
 
 def add_task(task_data: dict) -> dict:
     """
@@ -30,6 +47,18 @@ def add_task(task_data: dict) -> dict:
     Returns:
         dict: The inserted task data with the Supabase-generated ID, or an error.
     """
+    if MOCK_MODE:
+        # Mock implementation for testing
+        task_data['id'] = 1
+        if 'updatedAt' not in task_data:
+            task_data['updatedAt'] = datetime.now(timezone.utc).isoformat()
+        print(f"MOCK: Adding task: {task_data}")
+        return task_data
+    
+    similar = find_similar_task(task_data['task'])
+    if similar:
+        return {"error": "This task already exists.", "existing_task": similar}
+
     try:
         # Ensure updatedAt is set to current UTC time if not provided (Supabase default usually handles this)
         if 'updatedAt' not in task_data:
@@ -40,10 +69,12 @@ def add_task(task_data: dict) -> dict:
         if 'Rewards' in task_data:
             task_data['Reward'] = task_data.pop('Rewards') # Change key from 'Rewards' to 'Reward'
 
+        if 'recurrence' not in task_data:
+            task_data['recurrence'] = None
+
         response = supabase.table("tasks").insert(task_data).execute()
         # Supabase client returns a response object; the data is in response.data
         if response.data:
-            print(f"Task added successfully: {response.data[0]}")
             return response.data[0] # Return the first item if multiple are returned
         else:
             # Check for specific error codes like PGRST204 (missing column)
@@ -100,7 +131,6 @@ def update_task(task_id: str = None, task_name: str = None, updates: dict = {}) 
         response = supabase.table("tasks").update(updates).eq("id", target_task_id).execute()
 
         if response.data:
-            print(f"Task updated successfully: {response.data[0]}")
             return response.data[0]
         else:
             print(f"Failed to update task: {response.status_code} - {response.count}")
@@ -154,6 +184,16 @@ def get_tasks(status: str = None) -> list:
     Returns:
         list: A list of task dictionaries.
     """
+    if MOCK_MODE:
+        # Mock implementation for testing
+        mock_tasks = [
+            {"id": 1, "task": "Mock Task 1", "is_completed": "Pending", "Due_Date": "2024-01-15", "Due_Time": "17:00", "Reward": "30 mins video games"},
+            {"id": 2, "task": "Mock Task 2", "is_completed": "Progress", "Due_Date": "2024-01-16", "Due_Time": "20:00", "Reward": "Extra dessert"}
+        ]
+        if status:
+            return [t for t in mock_tasks if t["is_completed"] == status]
+        return mock_tasks
+    
     try:
         if status:
             response = supabase.table("tasks").select("*").eq("is_completed", status).order("updatedAt", desc=True).execute()
@@ -194,20 +234,65 @@ def find_task_by_name(task_name: str) -> list:
         print(f"Error finding task by name: {e}")
         return []
 
-def delete_all_tasks():
+def delete_all_tasks() -> dict:
     """
     Deletes all tasks from the Supabase 'tasks' table.
-    Used for the /reset-conversation endpoint.
+    Use with caution!
+
+    Returns:
+        dict: Result status.
     """
     try:
-        # A more robust way to delete all records when IDs are UUIDs and 'neq' causes issues.
-        # This assumes 'updatedAt' column exists and is a timestamp.
-        # It deletes all records where 'updatedAt' is greater than a very old timestamp.
-        response = supabase.table("tasks").delete().gt("updatedAt", "1970-01-01T00:00:00+00:00").execute()
-        print(f"All tasks deleted from Supabase. Count: {response.count}")
-        return {"success": True, "count": response.count}
+        response = supabase.table("tasks").delete().neq("id", 0).execute() # Delete where id != 0 (deletes all)
+        if response.data is not None: # Success or empty result
+            print(f"All tasks deleted successfully. Deleted count: {len(response.data) if response.data else 'Unknown'}")
+            return {"success": True, "deleted_count": len(response.data) if response.data else 0}
+        else:
+            print(f"Failed to delete all tasks: {response}")
+            return {"error": "Failed to delete all tasks", "details": response}
     except Exception as e:
         print(f"Error deleting all tasks: {e}")
+        return {"error": str(e)}
+
+def get_timmy_zone() -> str:
+    """
+    Retrieves Timmy's current zone from the Supabase 'timmy' table.
+    
+    Returns:
+        str: The current zone ('Red', 'Green', or 'Blue'). Defaults to 'Green' if not found.
+    """
+    if MOCK_MODE:
+        return "Green"
+    try:
+        response = supabase.table("timmy").select("zone").eq("id", 1).execute()
+        if response.data and len(response.data) > 0:
+            return response.data[0].get("zone", "Green")
+        else:
+            return "Green"
+    except Exception as e:
+        print(f"Error retrieving Timmy's zone: {e}")
+        return "Green"
+
+def update_timmy_zone(zone: str) -> dict:
+    """
+    Updates Timmy's zone in the Supabase 'timmy' table.
+    
+    Args:
+        zone (str): The new zone ('Red', 'Green', or 'Blue').
+        
+    Returns:
+        dict: The updated record or error information.
+    """
+    valid_zones = ["Red", "Green", "Blue"]
+    if zone not in valid_zones:
+        return {"error": f"Invalid zone '{zone}'. Must be one of {valid_zones}."}
+    if MOCK_MODE:
+        return {"id": 1, "zone": zone}
+    try:
+        response = supabase.table("timmy").upsert({"id": 1, "zone": zone}).execute()
+        return response.data[0] if response.data else {"error": "Update failed"}
+    except Exception as e:
+        print(f"Error updating Timmy's zone: {e}")
         return {"error": str(e)}
 
 # --- Test Block (Run this file directly to test Supabase connection and functions) ---

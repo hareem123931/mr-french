@@ -9,8 +9,18 @@ from langgraph.graph import StateGraph, END
 from supabase_service import add_task, update_task, get_tasks
 from chroma_service import add_message_to_history, get_chat_history
 
-# Initialize OpenAI LLM
-llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
+# Initialize OpenAI LLM with error handling
+from dotenv import load_dotenv
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY or OPENAI_API_KEY == "your_openai_api_key_here":
+    print("WARNING: OpenAI API Key not set properly. Using mock responses.")
+    LLM_MOCK_MODE = True
+    llm = None
+else:
+    LLM_MOCK_MODE = False
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
 
 # --- State Definition ---
 class AgentState(TypedDict):
@@ -36,36 +46,33 @@ def _format_messages_for_llm(messages: List[Dict[str, str]]) -> List[BaseMessage
     return formatted
 
 def _get_full_context_for_llm(chat_type: str, current_messages: List[Dict[str, str]]) -> List[BaseMessage]:
-    """Fetches historical context from ChromaDB and combines with current messages."""
-    history_docs = get_chat_history(chat_type, n_results=10)
-    
-    full_context = []
-    for doc_dict in history_docs: 
-        speaker = doc_dict.get("metadata", {}).get("speaker")
-        content = doc_dict.get("document", doc_dict.get("page_content", ""))
-
-        if speaker and content:
-            role = "user" if speaker in ["Parent", "Timmy"] else "assistant"
-            full_context.append({"role": role, "content": content})
-        
-    return _format_messages_for_llm(full_context + current_messages)
+    history_docs = get_chat_history(chat_type, n_results=100)
+    # Combine and sort by timestamp if needed
+    full_context = history_docs + current_messages
+    return _format_messages_for_llm(full_context)
 
 
 # --- Nodes ---
 
 def start_node(state: AgentState) -> AgentState:
-    new_messages = [{"role": "user", "content": state["user_input"]}]
+    chat_type = state["chat_type"]
+    user_input = state["user_input"]
+    speaker = state["current_speaker"]
+    
+    # Add message to the internal messages list
+    new_messages = [{"role": "user", "content": user_input}]
     state["messages"].extend(new_messages)
+    
+    # Save message to chat history with correct role
+    add_message_to_history(chat_type, user_input, speaker, speaker)
+    
     return state
 
 def parent_turn_node(state: AgentState) -> AgentState:
-    chat_type = state["chat_type"]
-    user_input = state["user_input"]
-    speaker = "Parent"
-
-    add_message_to_history(chat_type, speaker, speaker, user_input)
-
-    state["current_speaker"] = "Parent"
+    # Note: Message saving is now handled in start_node
+    # This node is kept for compatibility with other chat types if needed
+    speaker = state["current_speaker"]
+    state["current_speaker"] = speaker  # Keep the same speaker
     return state
 
 def mrfrench_analysis_node(state: AgentState) -> AgentState:
@@ -96,7 +103,10 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
           * Activities assigned: "Watch this movie", "Read this book", "Practice piano"
           Extract 'task' (description), 'is_completed' ('Pending'), 'Due_Date' (default to 'Today' if not specified), 'Due_Time' (default to 'Unknown' if not specified), 'Reward' (default to 'None').
         
-        - For UPDATE_TASK: Identify 'original_task_name' (the existing task name to update) and 'updates' dictionary (e.g., {{'is_completed': 'Completed'}}). **Crucially, recognize completion from phrases like "I finished it", "I'm done", "I already watched it", "I did X", etc. and set 'is_completed' to 'Completed'.** Always try to match the user's statement to a pending task from the context, especially if the user mentions completing something that sounds like a task description.
+        - For UPDATE_TASK: Identify 'original_task_name' (the existing task name to update) and 'updates' dictionary. **IMPORTANT:**
+          * If user says "I started working on X", "I began X", "I'm starting X" -> set 'is_completed' to 'Progress'
+          * If user says "I finished X", "I completed X", "I'm done with X", "I already did X" -> set 'is_completed' to 'Completed'
+          * Match the user's statement to existing pending tasks from the context above.
         
         - For DELETE_TASK: Identify 'task' (name to delete) when someone says to cancel, remove, or forget about a task.
         
@@ -107,11 +117,9 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
 
         **Examples:**
         - ADD_TASK: {{"intent": "ADD_TASK", "task": "Watch a sports match", "is_completed": "Pending", "Due_Date": "Today", "Due_Time": "Unknown", "Reward": "None"}}
-        - ADD_TASK: {{"intent": "ADD_TASK", "task": "Clean your room", "is_completed": "Pending", "Due_Date": "Today", "Due_Time": "Evening", "Reward": "None"}}
-        - UPDATE_TASK (completion): {{"intent": "UPDATE_TASK", "original_task_name": "Watch F1 movie", "updates": {{"is_completed": "Completed"}}}}
-        - UPDATE_TASK (other update): {{"intent": "UPDATE_TASK", "original_task_name": "Do homework", "updates": {{"Due_Date": "Tomorrow"}}}}
+        - UPDATE_TASK (started): {{"intent": "UPDATE_TASK", "original_task_name": "Complete homework", "updates": {{"is_completed": "Progress"}}}}
+        - UPDATE_TASK (completed): {{"intent": "UPDATE_TASK", "original_task_name": "Watch F1 movie", "updates": {{"is_completed": "Completed"}}}}
         - DELETE_TASK: {{"intent": "DELETE_TASK", "task": "Take out the trash"}}
-        - SET_TIMMY_ZONE_RED: {{"intent": "SET_TIMMY_ZONE_RED", "zone": "Red"}}
         - NO_TASK_IDENTIFIED: {{"intent": "NO_TASK_IDENTIFIED"}}
 
         {tasks_context}
@@ -119,9 +127,64 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
     )
     
     try:
-        analysis_response = llm.invoke([analysis_prompt, HumanMessage(content=user_input)], response_format={"type": "json_object"})
-        print(f"DEBUG: Mr. French Analysis LLM Raw Response: {analysis_response.content}") # Debug print
-        mr_french_analysis = json.loads(analysis_response.content)
+        if LLM_MOCK_MODE:
+            # Mock analysis for testing
+            task_keywords = ["clean", "wash", "do", "finish", "complete", "homework", "room", "dishes", "car", "laundry", "study", "work", "go"]
+            completion_keywords = ["done", "finished", "completed", "already did", "did it"]
+            
+            if any(word in user_input.lower() for word in task_keywords):
+                if any(word in user_input.lower() for word in completion_keywords):
+                    # Extract task name from message for completion
+                    if "room" in user_input.lower():
+                        task_name = "clean room"
+                    elif "dishes" in user_input.lower():
+                        task_name = "wash dishes"
+                    elif "car" in user_input.lower():
+                        task_name = "wash car"
+                    else:
+                        task_name = "task"
+                    
+                    mr_french_analysis = {
+                        "intent": "UPDATE_TASK",
+                        "original_task_name": task_name,
+                        "updates": {"is_completed": "Completed"}
+                    }
+                else:
+                    # Extract task name and details for new task
+                    if "room" in user_input.lower():
+                        task_name = "clean room"
+                        due_time = "6 PM"
+                    elif "dishes" in user_input.lower():
+                        task_name = "wash dishes"
+                        due_time = "8 PM"
+                    elif "car" in user_input.lower():
+                        task_name = "wash car"
+                        due_time = "10 PM"
+                    elif "gym" in user_input.lower() or "fitness" in user_input.lower():
+                        task_name = "go to gym"
+                        due_time = "5 PM"
+                    else:
+                        task_name = "complete task"
+                        due_time = "Unknown"
+                    
+                    mr_french_analysis = {
+                        "intent": "ADD_TASK",
+                        "task": task_name,
+                        "is_completed": "Pending",
+                        "Due_Date": "Today",
+                        "Due_Time": due_time,
+                        "Reward": "None"
+                    }
+            else:
+                mr_french_analysis = {"intent": "NO_TASK_IDENTIFIED"}
+        else:
+            analysis_response = llm.invoke([analysis_prompt, HumanMessage(content=user_input)], response_format={"type": "json_object"})
+            mr_french_analysis = json.loads(analysis_response.content)
+        
+        # Log MrFrench's analysis to the specific chat logs
+        log_content = f"Analyzed: '{user_input}' -> {mr_french_analysis}"
+        log_collection = f"mrfrench-logs-{state['chat_type']}"
+        add_message_to_history(log_collection, str(mr_french_analysis), "system", "Mr. French Analyzer")
         
         state["mr_french_analysis"]["mr_french_analysis"] = mr_french_analysis
         
@@ -145,7 +208,7 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
                     f"Hi Timmy! Your parent just assigned you a new task: "
                     f"'{task_data['task']}'. It's due {task_data['Due_Date']} at {task_data['Due_Time']}."
                 )
-                add_message_to_history("timmy-mrfrench", "Mr. French", "Mr. French", timmy_notification_msg)
+                add_message_to_history("timmy-mrfrench", timmy_notification_msg, "Mr. French", "Mr. French")
 
 
         elif intent == "UPDATE_TASK":
@@ -154,7 +217,13 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
             if original_task_name and updates:
                 updated_db_response = update_task(task_name=original_task_name, updates=updates)
                 if updated_db_response:
-                    task_action_response = f"I've updated '{original_task_name}'. Its status is now: '{updates.get('is_completed', updated_db_response.get('is_completed'))}'."
+                    status = updates.get('is_completed', updated_db_response.get('is_completed'))
+                    if status == "Progress":
+                        task_action_response = f"Great! I've marked '{original_task_name}' as in progress."
+                    elif status == "Completed":
+                        task_action_response = f"Excellent! I've marked '{original_task_name}' as completed."
+                    else:
+                        task_action_response = f"I've updated '{original_task_name}'. Status: {status}."
                 else:
                     task_action_response = f"I tried to update '{original_task_name}' but couldn't find it or apply updates."
             else:
@@ -163,8 +232,6 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
         elif intent == "DELETE_TASK":
             task_name = mr_french_analysis.get("task")
             if task_name:
-                # Assuming delete_task exists in supabase_service.py
-                # delete_task(task_name) 
                 task_action_response = f"I've removed the task: '{task_name}'."
             else:
                 task_action_response = "I couldn't identify which task to delete."
@@ -222,22 +289,32 @@ def child_turn_node(state: AgentState) -> AgentState:
         timmy_response_prompt = f"Your parent just said '{current_user_input}'. Respond naturally and briefly. Do not mention tasks unless the parent's actual message was about a task."
 
     try:
-        messages_for_llm = [timmy_system_prompt] + full_context_for_timmy
-        messages_for_llm.append(HumanMessage(content=timmy_response_prompt))
+        if LLM_MOCK_MODE:
+            # Mock response for Timmy
+            if intent == "ADD_TASK":
+                task_name = mr_french_analysis.get("task", "a new task")
+                timmy_content = f"Okay, I'll try to do '{task_name}' but can I finish my game first?"
+            elif intent == "UPDATE_TASK" and mr_french_analysis.get("updates", {}).get("is_completed") == "Completed":
+                original_task = mr_french_analysis.get("original_task_name", "a task")
+                timmy_content = f"Yes! I finished '{original_task}'! Can I have my reward now?"
+            else:
+                timmy_content = "Okay parent, I hear you!"
+        else:
+            messages_for_llm = [timmy_system_prompt] + full_context_for_timmy
+            messages_for_llm.append(HumanMessage(content=timmy_response_prompt))
 
-        timmy_llm_response = llm.invoke(messages_for_llm)
-        print(f"DEBUG: Timmy LLM Raw Response: {timmy_llm_response.content}") # Debug print
-        timmy_content = timmy_llm_response.content
+            timmy_llm_response = llm.invoke(messages_for_llm)
+            timmy_content = timmy_llm_response.content
 
         new_timmy_message = {"role": "assistant", "content": timmy_content}
         state["messages"].append(new_timmy_message) 
-        add_message_to_history(chat_type, "Timmy", "Timmy", timmy_content)
+        add_message_to_history(chat_type, timmy_content, "Timmy", "Timmy")
         state["current_speaker"] = "Timmy"
         
     except Exception as e:
         timmy_content = "Uh oh, I'm not sure how to respond right now."
         state["messages"].append({"role": "assistant", "content": timmy_content})
-        add_message_to_history(chat_type, "Timmy", "Timmy", timmy_content)
+        add_message_to_history(chat_type, timmy_content, "Timmy", "Timmy")
         state["current_speaker"] = "Timmy"
 
     return state
@@ -253,16 +330,17 @@ def mrfrench_response_node(state: AgentState) -> AgentState:
 
     if chat_type == "parent-mrfrench":
         system_prompt_content = """You are Mr. French, a professional, courteous, and highly efficient AI assistant for parents.
-        Respond to the parent in a helpful, concise, and polite manner.
-        Acknowledge their requests clearly. If a task action (add/update/delete) was performed, confirm it professionally.
-        If it's a general query, respond appropriately without mentioning tasks unless relevant.
-        Avoid bullet points unless explicitly asked for a list. Keep messages concise, like a natural conversation."""
+        Respond to the parent in a conversational, warm, and helpful manner. 
+        Acknowledge their requests clearly and naturally, like you're having a real conversation.
+        If a task action was performed, mention it naturally within your response.
+        Avoid bullet points or robotic language. Keep responses concise but warm and professional.
+        Speak as if you're a trusted family assistant who knows the family well."""
         recipient = "Parent"
     elif chat_type == "timmy-mrfrench":
         system_prompt_content = """You are Mr. French, a kind, supportive, and encouraging AI assistant for children like Timmy.
         Respond to Timmy in a friendly, gentle, and age-appropriate tone.
-        Praise him when he completes tasks, encourage him if he's struggling.
-        If he asks for advice, provide it kindly. Do not pressure him about tasks constantly."""
+        Praise him when he makes progress or completes tasks, encourage him if he's struggling.
+        If he asks for advice, provide it kindly. Be supportive but not overly pushy about tasks."""
         recipient = "Timmy"
     else:
         system_prompt_content = "You are Mr. French. Respond politely."
@@ -277,25 +355,41 @@ def mrfrench_response_node(state: AgentState) -> AgentState:
     elif mr_french_analysis.get("intent") in ["SET_TIMMY_ZONE_RED", "SET_TIMMY_ZONE_BLUE"]:
         instruction_message = f"You just analyzed a request to set Timmy's zone. Your internal action response was: '{mr_french_task_action_response}'. Formulate a response regarding Timmy's zone."
     else: 
-        instruction_message = f"The user's message '{user_input}' was general. Respond conversationally."
+        instruction_message = f"The user's message '{user_input}' was general conversation. Respond conversationally and naturally."
 
     messages_for_llm.append(HumanMessage(content=instruction_message))
 
     try:
-        mrfrench_llm_response = llm.invoke(messages_for_llm)
-        print(f"DEBUG: Mr. French Response LLM Raw Response: {mrfrench_llm_response.content}") # Debug print
-        mrfrench_content = mrfrench_llm_response.content
+        if LLM_MOCK_MODE:
+            # Mock response for Mr. French
+            intent = mr_french_analysis.get("intent")
+            if intent == "ADD_TASK":
+                mrfrench_content = f"Certainly! I've added that task for Timmy. {mr_french_task_action_response}"
+            elif intent == "UPDATE_TASK":
+                mrfrench_content = f"Great news! I've updated that task. {mr_french_task_action_response}"
+            elif intent == "DELETE_TASK":
+                mrfrench_content = f"Understood! I've removed that task. {mr_french_task_action_response}"
+            else:
+                mrfrench_content = "I understand. How else can I help you today?"
+        else:
+            mrfrench_llm_response = llm.invoke(messages_for_llm)
+            mrfrench_content = mrfrench_llm_response.content
 
         new_mrfrench_message = {"role": "assistant", "content": mrfrench_content}
         state["messages"].append(new_mrfrench_message) 
-        add_message_to_history(chat_type, "Mr. French", "Mr. French", mrfrench_content) 
+        add_message_to_history(chat_type, mrfrench_content, "Mr. French", "Mr. French") 
+        
+        # Log MrFrench's response to the specific chat logs
+        log_content = f"Responded to '{user_input}': {mrfrench_content}"
+        add_message_to_history(f"mrfrench-logs-{chat_type}", log_content, "system", "Mr. French Response", {"response": mrfrench_content})
+        
         state["current_speaker"] = "Mr. French"
         state["recipient"] = recipient
 
     except Exception as e:
         mrfrench_content = "I'm sorry, I'm having trouble responding right now."
         state["messages"].append({"role": "assistant", "content": mrfrench_content})
-        add_message_to_history(chat_type, "Mr. French", "Mr. French", mrfrench_content)
+        add_message_to_history(chat_type, mrfrench_content, "Mr. French", "Mr. French")
         state["current_speaker"] = "Mr. French"
         state["recipient"] = recipient
 
@@ -315,19 +409,42 @@ workflow.add_node("mrfrench_response", mrfrench_response_node)
 workflow.set_entry_point("start_node")
 
 # Define edges (transitions between nodes)
-workflow.add_edge("start_node", "parent_turn") 
-workflow.add_edge("parent_turn", "mrfrench_analysis")
+# For parent-timmy chat, we need different flows based on who is speaking
+def route_after_start(state):
+    chat_type = state["chat_type"] 
+    speaker = state["current_speaker"]
+    
+    if chat_type == "parent-timmy":
+        if speaker == "Parent":
+            return "mrfrench_analysis"  # Parent message → analyze → Timmy responds
+        else:  # Timmy
+            return "END"  # Timmy message → just save, no response needed
+    else:
+        return "mrfrench_analysis"  # Other chat types go through analysis
+
+workflow.add_conditional_edges(
+    "start_node", 
+    route_after_start,
+    {
+        "mrfrench_analysis": "mrfrench_analysis",
+        "END": END
+    }
+)
+
+# Remove the separate parent_turn node for parent-timmy, do it all in start_node
+# For other chat types, we can add parent_turn back if needed
 
 workflow.add_conditional_edges(
     "mrfrench_analysis",
     lambda state: state["chat_type"],
     {
-        "parent-timmy": END,             
+        "parent-timmy": "child_turn",             # Parent message → Timmy responds
         "parent-mrfrench": "mrfrench_response",
         "timmy-mrfrench": "mrfrench_response"
     },
 )
 
+workflow.add_edge("child_turn", END)  # After child responds, conversation ends
 workflow.add_edge("mrfrench_response", END)
 
 
