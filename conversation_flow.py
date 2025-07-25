@@ -63,7 +63,7 @@ def parent_turn_node(state: AgentState) -> AgentState:
     user_input = state["user_input"]
     speaker = "Parent"
 
-    add_message_to_history(chat_type, speaker, speaker, user_input)
+    add_message_to_history(chat_type, user_input, speaker, speaker)
 
     state["current_speaker"] = "Parent"
     return state
@@ -85,7 +85,7 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
 
     analysis_prompt = SystemMessage(
         content=f"""You are Mr. French, a sophisticated AI assistant.
-        Your primary role is to analyze user messages for task-related intents (ADD_TASK, UPDATE_TASK, DELETE_TASK) or general conversation (NO_TASK_IDENTIFIED).
+        Your primary role is to analyze user messages for task-related intents (ADD_TASK, UPDATE_TASK, DELETE_TASK, QUERY_TASKS) or general conversation (NO_TASK_IDENTIFIED).
         You also need to identify 'Timmy Zone' related requests (SET_TIMMY_ZONE_RED, SET_TIMMY_ZONE_BLUE).
 
         **Task Intent Recognition Details:**
@@ -100,6 +100,15 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
         
         - For DELETE_TASK: Identify 'task' (name to delete) when someone says to cancel, remove, or forget about a task.
         
+        - For QUERY_TASKS: Look for questions about task status, progress, or updates. This includes:
+          * "What's the update on Timmy's tasks?"
+          * "What's Timmy's progress?"
+          * "How are the tasks going?"
+          * "Show me completed tasks"
+          * "What tasks are pending?"
+          * "What has Timmy finished?"
+          Identify the 'status_filter' if specific ('Completed', 'Pending', 'Progress') or 'All' for general queries.
+        
         - For SET_TIMMY_ZONE_RED or SET_TIMMY_ZONE_BLUE: Identify the 'zone' ('Red' or 'Blue').
 
         **Response Format:**
@@ -111,6 +120,8 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
         - UPDATE_TASK (completion): {{"intent": "UPDATE_TASK", "original_task_name": "Watch F1 movie", "updates": {{"is_completed": "Completed"}}}}
         - UPDATE_TASK (other update): {{"intent": "UPDATE_TASK", "original_task_name": "Do homework", "updates": {{"Due_Date": "Tomorrow"}}}}
         - DELETE_TASK: {{"intent": "DELETE_TASK", "task": "Take out the trash"}}
+        - QUERY_TASKS: {{"intent": "QUERY_TASKS", "status_filter": "All"}}
+        - QUERY_TASKS: {{"intent": "QUERY_TASKS", "status_filter": "Completed"}}
         - SET_TIMMY_ZONE_RED: {{"intent": "SET_TIMMY_ZONE_RED", "zone": "Red"}}
         - NO_TASK_IDENTIFIED: {{"intent": "NO_TASK_IDENTIFIED"}}
 
@@ -145,7 +156,7 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
                     f"Hi Timmy! Your parent just assigned you a new task: "
                     f"'{task_data['task']}'. It's due {task_data['Due_Date']} at {task_data['Due_Time']}."
                 )
-                add_message_to_history("timmy-mrfrench", "Mr. French", "Mr. French", timmy_notification_msg)
+                add_message_to_history("timmy-mrfrench", timmy_notification_msg, "Mr. French", "Mr. French")
 
 
         elif intent == "UPDATE_TASK":
@@ -168,6 +179,36 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
                 task_action_response = f"I've removed the task: '{task_name}'."
             else:
                 task_action_response = "I couldn't identify which task to delete."
+
+        elif intent == "QUERY_TASKS":
+            status_filter = mr_french_analysis.get("status_filter", "All")
+            if status_filter == "All":
+                queried_tasks = get_tasks()
+            else:
+                queried_tasks = get_tasks(status=status_filter)
+            
+            if queried_tasks:
+                task_list = []
+                for task in queried_tasks:
+                    task_name = task.get('task', 'Unnamed Task')
+                    status = task.get('is_completed', 'Pending')
+                    due_date = task.get('Due_Date', 'Unknown')
+                    due_time = task.get('Due_Time', 'Unknown')
+                    
+                    task_info = f"'{task_name}' (Status: {status})"
+                    if due_date != "Unknown" or due_time != "Unknown":
+                        task_info += f", Due: {due_date} {due_time}".strip()
+                    task_list.append(task_info)
+                
+                if status_filter == "All":
+                    task_action_response = f"Here are all of Timmy's tasks:\n" + "\n".join([f"• {task}" for task in task_list])
+                else:
+                    task_action_response = f"Here are Timmy's {status_filter.lower()} tasks:\n" + "\n".join([f"• {task}" for task in task_list])
+            else:
+                if status_filter == "All":
+                    task_action_response = "Timmy currently has no tasks assigned."
+                else:
+                    task_action_response = f"Timmy has no {status_filter.lower()} tasks at the moment."
 
         elif intent in ["SET_TIMMY_ZONE_RED", "SET_TIMMY_ZONE_BLUE"]:
             zone = mr_french_analysis.get("zone")
@@ -231,13 +272,13 @@ def child_turn_node(state: AgentState) -> AgentState:
 
         new_timmy_message = {"role": "assistant", "content": timmy_content}
         state["messages"].append(new_timmy_message) 
-        add_message_to_history(chat_type, "Timmy", "Timmy", timmy_content)
+        add_message_to_history(chat_type, timmy_content, "Timmy", "Timmy")
         state["current_speaker"] = "Timmy"
         
     except Exception as e:
         timmy_content = "Uh oh, I'm not sure how to respond right now."
         state["messages"].append({"role": "assistant", "content": timmy_content})
-        add_message_to_history(chat_type, "Timmy", "Timmy", timmy_content)
+        add_message_to_history(chat_type, timmy_content, "Timmy", "Timmy")
         state["current_speaker"] = "Timmy"
 
     return state
@@ -274,6 +315,8 @@ def mrfrench_response_node(state: AgentState) -> AgentState:
     
     if mr_french_analysis.get("intent") in ["ADD_TASK", "UPDATE_TASK", "DELETE_TASK"]:
         instruction_message = f"You just analyzed the message and detected a task action. Your internal action response was: '{mr_french_task_action_response}'. Formulate a natural, conversational response based on this action and the user's original message: '{user_input}'."
+    elif mr_french_analysis.get("intent") == "QUERY_TASKS":
+        instruction_message = f"The user asked about task status/updates. You have retrieved the actual task data: '{mr_french_task_action_response}'. Present this information naturally in response to their query: '{user_input}'. Be helpful and conversational."
     elif mr_french_analysis.get("intent") in ["SET_TIMMY_ZONE_RED", "SET_TIMMY_ZONE_BLUE"]:
         instruction_message = f"You just analyzed a request to set Timmy's zone. Your internal action response was: '{mr_french_task_action_response}'. Formulate a response regarding Timmy's zone."
     else: 
@@ -288,14 +331,14 @@ def mrfrench_response_node(state: AgentState) -> AgentState:
 
         new_mrfrench_message = {"role": "assistant", "content": mrfrench_content}
         state["messages"].append(new_mrfrench_message) 
-        add_message_to_history(chat_type, "Mr. French", "Mr. French", mrfrench_content) 
+        add_message_to_history(chat_type, mrfrench_content, "Mr. French", "Mr. French") 
         state["current_speaker"] = "Mr. French"
         state["recipient"] = recipient
 
     except Exception as e:
         mrfrench_content = "I'm sorry, I'm having trouble responding right now."
         state["messages"].append({"role": "assistant", "content": mrfrench_content})
-        add_message_to_history(chat_type, "Mr. French", "Mr. French", mrfrench_content)
+        add_message_to_history(chat_type, mrfrench_content, "Mr. French", "Mr. French")
         state["current_speaker"] = "Mr. French"
         state["recipient"] = recipient
 
