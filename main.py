@@ -126,8 +126,9 @@ async def chat_endpoint(
         try:
             user_role, ai_role = determine_roles(chat_type, user_type)
 
-            add_message_to_history(chat_type, message_content=user_input, role=user_role, sender=user_type)
-            add_message_to_history(chat_type, message_content=response_message, role=ai_role, sender=ai_role)
+            add_message_to_history(chat_type, user_input, user_role, user_type)
+            add_message_to_history(chat_type, response_message, ai_role, ai_role)
+
 
         except Exception as save_e:
             logger.error(f"Failed to save chat history: {save_e}", exc_info=True)
