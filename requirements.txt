@@ -1,0 +1,11 @@
+python-dotenv
+openai
+langchain
+langgraph
+chromadb
+supabase
+fastapi
+uvicorn
+python-crontab
+langchain_openai
+pytz
