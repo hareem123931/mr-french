@@ -63,6 +63,11 @@ def add_message_to_history(collection_name: str, message_content: str, role: str
     try:
         if metadata is None:
             metadata = {}
+        # Flatten any dict values in metadata
+        for k, v in list(metadata.items()):
+            if isinstance(v, dict):
+                import json
+                metadata[k] = json.dumps(v)
         # Add required metadata
         metadata.update({"role": role, "sender": sender, "timestamp": datetime.now(timezone.utc).isoformat()})
 
