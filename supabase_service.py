@@ -13,9 +13,11 @@ SUPABASE_URL: str = os.getenv("SUPABASE_URL")
 SUPABASE_KEY: str = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Supabase URL and Key must be set in the .env file.")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("WARNING: Supabase URL and Key must be set in the .env file.")
+    print("Using placeholder values. Please update .env file with your actual Supabase credentials.")
+    supabase = None
+else:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def add_task(task_data: dict) -> dict:
     """
@@ -30,6 +32,10 @@ def add_task(task_data: dict) -> dict:
     Returns:
         dict: The inserted task data with the Supabase-generated ID, or an error.
     """
+    if supabase is None:
+        print("Supabase client not initialized. Please check your .env file.")
+        return {"error": "Supabase client not initialized"}
+        
     try:
         # Ensure updatedAt is set to current UTC time if not provided (Supabase default usually handles this)
         if 'updatedAt' not in task_data:
@@ -70,6 +76,10 @@ def update_task(task_id: str = None, task_name: str = None, updates: dict = {}) 
     Returns:
         dict: The updated task data, or an error.
     """
+    if supabase is None:
+        print("Supabase client not initialized. Please check your .env file.")
+        return {"error": "Supabase client not initialized"}
+        
     if not task_id and not task_name:
         return {"error": "Either task_id or task_name must be provided for update."}
     if not updates:
@@ -120,6 +130,10 @@ def delete_task(task_id: str = None, task_name: str = None) -> dict:
     Returns:
         dict: Confirmation of deletion or an error.
     """
+    if supabase is None:
+        print("Supabase client not initialized. Please check your .env file.")
+        return {"error": "Supabase client not initialized"}
+        
     if not task_id and not task_name:
         return {"error": "Either task_id or task_name must be provided for deletion."}
 
@@ -154,6 +168,10 @@ def get_tasks(status: str = None) -> list:
     Returns:
         list: A list of task dictionaries.
     """
+    if supabase is None:
+        print("Supabase client not initialized. Please check your .env file.")
+        return []
+        
     try:
         if status:
             response = supabase.table("tasks").select("*").eq("is_completed", status).order("updatedAt", desc=True).execute()
@@ -178,6 +196,10 @@ def find_task_by_name(task_name: str) -> list:
     Returns:
         list: A list of task dictionaries that exactly match the name.
     """
+    if supabase is None:
+        print("Supabase client not initialized. Please check your .env file.")
+        return []
+        
     try:
         # Using .ilike for a robust search that's generally case-insensitive.
         response = supabase.table("tasks").select("*").ilike("task", task_name).execute()
@@ -199,6 +221,10 @@ def delete_all_tasks():
     Deletes all tasks from the Supabase 'tasks' table.
     Used for the /reset-conversation endpoint.
     """
+    if supabase is None:
+        print("Supabase client not initialized. Please check your .env file.")
+        return {"error": "Supabase client not initialized"}
+        
     try:
         # A more robust way to delete all records when IDs are UUIDs and 'neq' causes issues.
         # This assumes 'updatedAt' column exists and is a timestamp.

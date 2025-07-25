@@ -365,11 +365,13 @@ workflow.add_conditional_edges(
     "mrfrench_analysis",
     lambda state: state["chat_type"],
     {
-        "parent-timmy": END,             
+        "parent-timmy": "child_turn",             
         "parent-mrfrench": "mrfrench_response",
         "timmy-mrfrench": "mrfrench_response"
     },
 )
+
+workflow.add_edge("child_turn", END)
 
 workflow.add_edge("mrfrench_response", END)
 
