@@ -1,0 +1,9 @@
+.env
+
+__pycache__/
+
+venv/
+
+chroma_db/
+
+w.py

@@ -1,289 +1,170 @@
-# llm_service.py
+# timmy_ai_backend/llm_service.py
+
 import os
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage # Import message types
-from typing import List, Dict, Any, Literal
-import logging
+from openai import OpenAI
+import json # Will be useful for parsing Mr. French's analysis JSON
 
+# Load environment variables from .env file
 load_dotenv()
 
-logger = logging.getLogger(__name__)
+# Initialize the OpenAI client
+# Ensure OPENAI_API_KEY is set in your .env file
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Initialize LLM
-# Consider using gpt-4o or gpt-4-turbo for better performance and cost-efficiency
-llm = ChatOpenAI(model="gpt-4-turbo", temperature=0.7) 
+# --- Define Persona Prompts ---
 
-# --- Prompt Definitions ---
-
-MR_FRENCH_OBSERVER_PROMPT_TEMPLATE = """
-You are Mr. French, a sophisticated AI observing a conversation between a Parent and Timmy.
-Your primary role is to analyze the conversation *for task-related information only*.
-You will not directly participate in the conversation unless explicitly told to.
-When you detect a task-related intent (add, update, delete, complete, inquire, reward, or assign self-task), you must extract the details.
-If no task-related intent is found, state that you didn't identify any task.
-If the parent explicitly mentions setting Timmy's zone, identify that intent.
-
-Task Schema:
-- task (string): Description/name of the task.
-- is_completed (string): Status of the task: 'Completed', 'Pending', 'Progress'.
-- Due_Date (string): Deadline in terms of day/date: 'Today', 'Tomorrow', 'Next Weekend', '18-10-2025', 'None'.
-- Due_Time (string): Deadline in terms of time: '8AM', '10PM', 'evening', 'tonight', 'morning', 'None'.
-- Reward (string): Any reward associated with the task. 'None' if no reward. (Note: Use 'Reward' singular)
-
-Timmy Zone Schema:
-- zone (string): 'Red', 'Green', or 'Blue'.
-
-Your output must be a JSON object with the following structure:
-{{
-    "intent": "ADD_TASK" | "UPDATE_TASK" | "DELETE_TASK" | "GET_TASK" | "SET_TIMMY_ZONE" | "NO_TASK_IDENTIFIED" | "AWAITING_DATE_TIME",
-    "details": {{
-        "task": "...",
-        "is_completed": "...",
-        "Due_Date": "...",
-        "Due_Time": "...",
-        "Reward": "..."
-    }} | null,
-    "original_task_name": "...", // Only for UPDATE/DELETE, the original name of the task
-    "updates": {{ // Only for UPDATE, the fields to update
-        "task": "...",
-        "is_completed": "...",
-        "Due_Date": "...",
-        "Due_Time": "...",
-        "Reward": "..."
-    }} | null,
-    "zone": "Red" | "Green" | "Blue" | null, // Only for SET_TIMMY_ZONE
-    "reasoning": "Your thought process for analysis."
-}}
-
-If the parent assigns a task to Mr. French directly and doesn't mention date and time, set intent to "AWAITING_DATE_TIME" and include the task name in details.
-
-Examples:
-Parent: "Timmy, please clean your room by tomorrow evening."
-{{
-    "intent": "ADD_TASK",
-    "details": {{
-        "task": "clean room",
-        "is_completed": "Pending",
-        "Due_Date": "Tomorrow",
-        "Due_Time": "evening",
-        "Reward": "None"
-    }},
-    "original_task_name": null,
-    "updates": null,
-    "zone": null,
-    "reasoning": "Parent assigned a new task 'clean room' with a deadline of tomorrow evening."
-}}
-
-Timmy: "I finished my math homework."
-{{
-    "intent": "UPDATE_TASK",
-    "details": null,
-    "original_task_name": "math homework",
-    "updates": {{
-        "is_completed": "Completed"
-    }},
-    "zone": null,
-    "reasoning": "Timmy indicated completion of 'math homework'."
-}}
-
-Parent: "Mr. French, please add a task for Timmy: finish reading by Friday, with a reward of extra screen time."
-{{
-    "intent": "ADD_TASK",
-    "details": {{
-        "task": "finish reading",
-        "is_completed": "Pending",
-        "Due_Date": "Friday",
-        "Due_Time": "None",
-        "Reward": "extra screen time"
-    }},
-    "original_task_name": null,
-    "updates": null,
-    "zone": null,
-    "reasoning": "Parent asked to add a new task 'finish reading' by Friday with a reward."
-}}
-
-Parent: "Mr. French, add a task for Timmy to do the dishes."
-{{
-    "intent": "AWAITING_DATE_TIME",
-    "details": {{
-        "task": "do the dishes",
-        "is_completed": "Pending",
-        "Due_Date": "None",
-        "Due_Time": "None",
-        "Reward": "None"
-    }},
-    "original_task_name": null,
-    "updates": null,
-    "zone": null,
-    "reasoning": "Parent asked to add a task but did not provide due date/time."
-}}
-
-Parent: "What tasks does Timmy have pending?"
-{{
-    "intent": "GET_TASK",
-    "details": {{
-        "is_completed": "Pending"
-    }},
-    "original_task_name": null,
-    "updates": null,
-    "zone": null,
-    "reasoning": "Parent inquired about Timmy's pending tasks."
-}}
-
-Parent: "Put Timmy on red zone, he's misbehaving."
-{{
-    "intent": "SET_TIMMY_ZONE",
-    "details": null,
-    "original_task_name": null,
-    "updates": null,
-    "zone": "Red",
-    "reasoning": "Parent explicitly asked to set Timmy's zone to Red."
-}}
-
-Timmy: "I will do my XYZ tonight."
-{{
-    "intent": "ADD_TASK",
-    "details": {{
-        "task": "XYZ",
-        "is_completed": "Pending",
-        "Due_Date": "Today",
-        "Due_Time": "tonight",
-        "Reward": "None"
-    }},
-    "original_task_name": null,
-    "updates": null,
-    "zone": null,
-    "reasoning": "Timmy assigned a self-task 'XYZ' for tonight."
-}}
-
-Parent: "Timmy don't have to do this anymore"
-{{
-    "intent": "DELETE_TASK",
-    "details": null,
-    "original_task_name": "this",
-    "updates": null,
-    "zone": null,
-    "reasoning": "Parent cancelled a task for Timmy."
-}}
-
-Conversation:
-{chat_history}
-
-User Input: {user_input}
-Mr. French Analysis:
+# 1. Parent Persona Prompt
+# Purpose: Defines the Parent's conversational style and role.
+# Usage: Used when the system needs to generate a message from the Parent's perspective.
+PARENT_PROMPT = """
+You are a parent interacting with your child, Timmy, or directly with Mr. French.
+Your messages should be instructional, concerned, or query Mr. French about tasks.
+When speaking to Timmy, maintain a tone appropriate for a parent giving guidance or expressing concern.
+When speaking to Mr. French, be professional and clear, asking for updates or delegating tasks.
 """
 
-MR_FRENCH_PARENT_PROMPT_TEMPLATE = """
-You are Mr. French, a sophisticated AI designed to assist a parent with managing their child, Timmy.
-You are professional, polite, and helpful. Your responses should be like a message, not an email, and generally avoid bullet points unless absolutely necessary for clarity (e.g., listing tasks).
-Maintain proper contextual awareness.
-
-Previous conversation with Parent:
-{chat_history}
-
-Parent: {user_input}
-Mr. French:
+# 2. Child Persona (Timmy) Prompt
+# Purpose: Defines Timmy's conversational style and role.
+# Usage: Used when the system needs to generate a message from Timmy's perspective.
+CHILD_PROMPT = """
+You are Timmy, a child. You respond to your parent or to Mr. French directly.
+Your responses can reflect various behavior patterns such as resistance, compliance, or emotional feedback.
+You can also declare tasks complete (e.g., "I finished my homework").
+When speaking to Mr. French, you might ask about your tasks, upcoming deadlines, or even seek general advice.
 """
 
-MR_FRENCH_TIMMY_PROMPT_TEMPLATE = """
-You are Mr. French, a kind and supportive AI companion for Timmy.
-You act nicely and patiently with Timmy. You are helpful and encouraging.
-Maintain proper contextual awareness. You are not always enforcing tasks; you can also chat normally.
+# 3. Mr. French Persona Prompts
 
-Previous conversation with Timmy:
-{chat_history}
+# 3a. Mr. French Observer/Analyzer Prompt (The "Task Brain")
+# Purpose: To extract structured task-related information from ANY conversation turn.
+# Usage: This prompt is called by the system's *logic* to analyze ANY message
+#        (from Parent-Timmy chat, Parent-MrFrench chat, or Timmy-MrFrench chat)
+#        that might contain task assignments, updates, or deletions.
+#        Its output is always a structured JSON object.
+MR_FRENCH_OBSERVER_PROMPT = """
+You are Mr. French, an AI observer and analyzer. Your primary role is to monitor conversations
+to identify and extract task-related instructions, updates, and deletions from natural language.
 
-Timmy: {user_input}
-Mr. French:
+You are neutral, analytical, and highly skilled. Your output must be a structured JSON object
+indicating the intent (ADD_TASK, UPDATE_TASK, DELETE_TASK, NO_TASK) and relevant details.
+If you detect a task-related action, include all relevant details. If not, indicate NO_TASK.
+
+Be precise in identifying task names, distinguishing between similar tasks like 'math homework',
+'math project', and 'math hackathon'. You should also identify if a reward is assigned to a task.
+
+Expected JSON format examples:
+1. Adding a task:
+{"intent": "ADD_TASK", "task": "Clean your room", "is_completed": "Pending", "Due_Date": "Today", "Due_Time": "Evening", "Rewards": "None"}
+2. Updating a task (e.g., completion, status change):
+{"intent": "UPDATE_TASK", "original_task_name": "Clean your room", "updates": {"is_completed": "Completed"}}
+3. Deleting a task:
+{"intent": "DELETE_TASK", "task": "Clean your room"}
+4. No task-related action identified:
+{"intent": "NO_TASK"}
+
+If a task is being added and a Due_Date or Due_Time is missing but implied (e.g., "tonight"), extract it.
+If no explicit Due_Date or Due_Time is mentioned for an ADD_TASK, use "Unknown" or infer "Today" if context suggests immediate action (e.g. "Do this now").
 """
 
-PARENT_PROMPT_TEMPLATE = """
-You are acting as the Parent. Respond naturally and conversationally to Timmy.
-You can assign tasks, give rewards, ask about Timmy's day, etc.
-Keep your responses brief and natural.
-
-Previous conversation:
-{chat_history}
-
-Timmy: {user_input}
-Parent:
+# 3b. Mr. French Parent-Facing Prompt (The "Voice" to Parent)
+# Purpose: To generate Mr. French's direct conversational responses to the Parent.
+# Usage: This prompt is used *after* any necessary task analysis (performed by MR_FRENCH_OBSERVER_PROMPT)
+#        or other Mr. French decisions, to formulate a polite, professional, and grown-up message.
+#        It focuses purely on the conversational output, tone, and deadline formatting.
+MR_FRENCH_PARENT_PROMPT = """
+You are Mr. French, an AI assistant speaking directly to the parent.
+Your tone must be professional, respectful, and grown-up.
+You should communicate clearly and concisely, like a helpful assistant providing updates or confirming requests.
+Avoid overly casual language or excessive bullet points; your responses should feel like a smooth, polite conversation.
+When discussing tasks or deadlines, use natural language for short-term deadlines (e.g., "This weekend", "Tomorrow", "Next Monday", "This Wednesday") if they fall within the next 14 days from the current date. Otherwise, use a proper date format (YYYY-MM-DD).
 """
 
-TIMMY_PROMPT_TEMPLATE = """
-You are acting as Timmy, a kid. Respond naturally and conversationally to the Parent.
-You can talk about your tasks, your day, ask for advice, etc.
-Keep your responses brief and natural.
-
-Previous conversation:
-{chat_history}
-
-Parent: {user_input}
-Timmy:
+# 3c. Mr. French Timmy-Facing Prompt (The "Voice" to Timmy)
+# Purpose: To generate Mr. French's direct conversational responses to Timmy.
+# Usage: This prompt is used *after* any necessary task analysis (performed by MR_FRENCH_OBSERVER_PROMPT)
+#        or other Mr. French decisions, to formulate a nice, supportive, and encouraging message.
+#        It focuses purely on the conversational output, tone, and deadline formatting,
+#        and ensures he does not constantly enforce tasks.
+MR_FRENCH_TIMMY_PROMPT = """
+You are Mr. French, an AI assistant speaking directly to Timmy.
+Your tone must be nice, supportive, and encouraging, like a friendly mentor or big brother figure.
+Your responses should be conversational and easy for a child to understand.
+You can offer advice if asked, and should not constantly enforce tasks.
+When reminding Timmy about tasks or deadlines, use natural language for short-term deadlines (e.g., "This evening", "On Sunday", "Tomorrow", "Next Weekend") if they fall within the next 14 days from the current date. Otherwise, use a proper date format (YYYY-MM-DD).
 """
 
-async def get_llm_response(
-    prompt_template: str,
-    user_input: str,
-    chat_history: List[Dict[str, str]],
-) -> str:
+# --- Generic LLM Interaction Function ---
+
+def get_llm_response(system_prompt: str, messages: list, model: str = "gpt-4", temperature: float = 0.7) -> str:
     """
-    Gets a response from the LLM based on the given prompt template and chat history.
-    """
-    
-    # Constructing messages in the format expected by ChatOpenAI
-    messages_for_llm = [
-        SystemMessage(content=prompt_template)
-    ]
-    for msg in chat_history:
-        if msg["role"] == "user":
-            messages_for_llm.append(HumanMessage(content=msg["content"]))
-        elif msg["role"] == "assistant":
-            messages_for_llm.append(AIMessage(content=msg["content"]))
-    
-    messages_for_llm.append(HumanMessage(content=user_input))
+    Generates a response from the LLM given a system prompt and message history.
 
+    Args:
+        system_prompt (str): The initial system prompt defining the persona.
+        messages (list): A list of dictionaries representing the conversation history
+                         (e.g., [{"role": "user", "content": "Hello!"}]).
+        model (str): The LLM model to use (default: "gpt-4").
+        temperature (float): Controls randomness in the output (0.0-1.0).
+
+    Returns:
+        str: The generated response from the LLM.
+    """
+    full_messages = [{"role": "system", "content": system_prompt}] + messages
     try:
-        response = await llm.ainvoke(messages_for_llm)
-        if hasattr(response, 'content'):
-            return response.content
-        return str(response) # Fallback to string representation
+        response = client.chat.completions.create(
+            model=model,
+            messages=full_messages,
+            temperature=temperature,
+        )
+        return response.choices[0].message.content
     except Exception as e:
-        logger.error(f"Error getting LLM response: {e}", exc_info=True)
-        return "I'm sorry, I'm having trouble responding right now."
+        print(f"Error calling OpenAI API: {e}")
+        return "I'm sorry, I'm having trouble connecting right now."
 
-async def get_json_llm_response(
-    prompt_template: str,
-    user_input: str,
-    chat_history: List[Dict[str, str]],
-) -> Dict[str, Any]:
-    """
-    Gets a JSON response from the LLM, specifically for Mr. French's analysis.
-    """
-    # Constructing messages in the format expected by ChatOpenAI
-    messages_for_llm = [
-        SystemMessage(content=prompt_template)
-    ]
-    for msg in chat_history:
-        if msg["role"] == "user":
-            messages_for_llm.append(HumanMessage(content=msg["content"]))
-        elif msg["role"] == "assistant":
-            messages_for_llm.append(AIMessage(content=msg["content"]))
-    
-    messages_for_llm.append(HumanMessage(content=user_input))
+# --- Testing Block ---
+if __name__ == "__main__":
+    print("--- Testing LLM connection with a simple prompt ---")
+    test_messages = [{"role": "user", "content": "What is 2+2?"}]
+    response = get_llm_response("You are a helpful assistant.", test_messages, model="gpt-3.5-turbo")
+    print(f"Test Response: {response}")
+    if "4" in response:
+        print("LLM connection seems to be working!")
+    else:
+        print("LLM connection test failed or returned unexpected response.")
 
+    print("\n--- Testing Mr. French OBSERVER Prompt with a task assignment (simulating ANY chat) ---")
+    # This simulates a message Mr. French would analyze, regardless of who sent it or in which chat.
+    # The system logic will call the LLM with this prompt for analysis.
+    task_test_messages = [{"role": "user", "content": "Parent: Timmy needs to finish his science project by next Friday, and if he does, he gets a new video game."}]
+    mr_french_analysis_raw = get_llm_response(MR_FRENCH_OBSERVER_PROMPT, task_test_messages, model="gpt-3.5-turbo", temperature=0.0)
+    print(f"Raw Mr. French Analysis (Observer): {mr_french_analysis_raw}")
     try:
-        # Using with_structured_output for reliable JSON parsing
-        llm_json = llm.with_structured_output(schema=Dict[str, Any])
-        response = await llm_json.ainvoke(messages_for_llm)
-        
-        # Ensure the response is a dictionary
-        if isinstance(response, dict):
-            return response
-        else:
-            logger.warning(f"LLM did not return a dictionary for JSON response: {response}")
-            return {"intent": "NO_TASK_IDENTIFIED", "reasoning": "LLM did not return expected JSON format."}
-    except Exception as e:
-        logger.error(f"Error getting JSON LLM response: {e}", exc_info=True)
-        return {"intent": "NO_TASK_IDENTIFIED", "reasoning": f"Error during LLM JSON response generation: {e}"}
+        parsed_analysis = json.loads(mr_french_analysis_raw)
+        print(f"Parsed Mr. French Analysis (Observer): {json.dumps(parsed_analysis, indent=2)}")
+        if parsed_analysis.get("intent") == "ADD_TASK" and "science project" in parsed_analysis.get("task", "").lower():
+            print("Observer prompt successfully identified and structured the task!")
+    except json.JSONDecodeError:
+        print("Failed to parse Mr. French Observer output as JSON.")
+
+    print("\n--- Testing Mr. French PARENT-FACING Prompt (conversational output) ---")
+    # This simulates Mr. French generating a direct *conversational response* to the Parent.
+    # Task analysis would have already occurred *before* this response is generated, using MR_FRENCH_OBSERVER_PROMPT.
+    parent_chat_history = [
+        {"role": "user", "content": "Mr. French, what are Timmy's tasks for next week?"}
+    ]
+    mr_french_parent_response = get_llm_response(MR_FRENCH_PARENT_PROMPT, parent_chat_history, model="gpt-3.5-turbo")
+    print(f"Mr. French Parent Response: {mr_french_parent_response}")
+    if "professional" in mr_french_parent_response.lower() or "certainly" in mr_french_parent_response.lower():
+        print("Parent-facing prompt seems to be working for tone.")
+
+    print("\n--- Testing Mr. French TIMMY-FACING Prompt (conversational output) ---")
+    # This simulates Mr. French generating a direct *conversational response* to Timmy.
+    # Task analysis would have already occurred *before* this response is generated, using MR_FRENCH_OBSERVER_PROMPT.
+    timmy_chat_history = [
+        {"role": "user", "content": "Mr. French, I finished my homework!"}
+    ]
+    mr_french_timmy_response = get_llm_response(MR_FRENCH_TIMMY_PROMPT, timmy_chat_history, model="gpt-3.5-turbo")
+    print(f"Mr. French Timmy Response: {mr_french_timmy_response}")
+    if "great job" in mr_french_timmy_response.lower() or "well done" in mr_french_timmy_response.lower():
+        print("Timmy-facing prompt seems to be working for tone.")

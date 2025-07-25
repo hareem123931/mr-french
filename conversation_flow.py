@@ -1,15 +1,9 @@
-# conversation_flow.py
-
 import os
 import json
 from typing import Dict, List, Any, TypedDict, Union, Literal, Optional
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
-import logging
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 # --- Assuming these modules exist and are correctly implemented ---
 from supabase_service import add_task, update_task, get_tasks
@@ -69,25 +63,10 @@ def parent_turn_node(state: AgentState) -> AgentState:
     user_input = state["user_input"]
     speaker = "Parent"
 
-    from datetime import datetime, timezone
-    timestamp = datetime.now(timezone.utc).isoformat()
+    add_message_to_history(chat_type, speaker, speaker, user_input)
 
-    # Dynamically set receiver
-    if chat_type == "parent-timmy":
-        receiver = "Timmy"
-    elif chat_type == "parent-mrfrench":
-        receiver = "Mr. French"
-    else:
-        receiver = "Unknown"
-
-    # Save user message
-    add_message_to_history(chat_type, sender=speaker, receiver=receiver, content=user_input, timestamp=timestamp)
-
-    # Add to LangGraph state
-    state["messages"].append({"role": "user", "content": user_input})
-    state["current_speaker"] = speaker
+    state["current_speaker"] = "Parent"
     return state
-
 
 def mrfrench_analysis_node(state: AgentState) -> AgentState:
     user_input = state["user_input"]
@@ -110,15 +89,24 @@ def mrfrench_analysis_node(state: AgentState) -> AgentState:
         You also need to identify 'Timmy Zone' related requests (SET_TIMMY_ZONE_RED, SET_TIMMY_ZONE_BLUE).
 
         **Task Intent Recognition Details:**
-        - For ADD_TASK: Extract 'task' (description), 'is_completed' ('Pending', 'Completed', 'Progress'), 'Due_Date' (e.g., 'Today', 'Tomorrow', 'Next weekend', 'YYYY-MM-DD'), 'Due_Time' (e.g., '8 AM', 'evening', 'tonight'), 'Reward'.
+        - For ADD_TASK: Look for ANY instruction, command, or request that tells someone to do something. This includes:
+          * Direct commands: "Go watch a sports match", "Clean your room", "Do your homework"
+          * Polite requests: "Please take out the trash", "Can you finish your project"
+          * Instructions: "You need to study for the test", "Make sure to feed the dog"
+          * Activities assigned: "Watch this movie", "Read this book", "Practice piano"
+          Extract 'task' (description), 'is_completed' ('Pending'), 'Due_Date' (default to 'Today' if not specified), 'Due_Time' (default to 'Unknown' if not specified), 'Reward' (default to 'None').
+        
         - For UPDATE_TASK: Identify 'original_task_name' (the existing task name to update) and 'updates' dictionary (e.g., {{'is_completed': 'Completed'}}). **Crucially, recognize completion from phrases like "I finished it", "I'm done", "I already watched it", "I did X", etc. and set 'is_completed' to 'Completed'.** Always try to match the user's statement to a pending task from the context, especially if the user mentions completing something that sounds like a task description.
-        - For DELETE_TASK: Identify 'task' (name to delete).
+        
+        - For DELETE_TASK: Identify 'task' (name to delete) when someone says to cancel, remove, or forget about a task.
+        
         - For SET_TIMMY_ZONE_RED or SET_TIMMY_ZONE_BLUE: Identify the 'zone' ('Red' or 'Blue').
 
         **Response Format:**
         Respond *only* with a JSON object. If no task/zone intent is identified, use "NO_TASK_IDENTIFIED".
 
         **Examples:**
+        - ADD_TASK: {{"intent": "ADD_TASK", "task": "Watch a sports match", "is_completed": "Pending", "Due_Date": "Today", "Due_Time": "Unknown", "Reward": "None"}}
         - ADD_TASK: {{"intent": "ADD_TASK", "task": "Clean your room", "is_completed": "Pending", "Due_Date": "Today", "Due_Time": "Evening", "Reward": "None"}}
         - UPDATE_TASK (completion): {{"intent": "UPDATE_TASK", "original_task_name": "Watch F1 movie", "updates": {{"is_completed": "Completed"}}}}
         - UPDATE_TASK (other update): {{"intent": "UPDATE_TASK", "original_task_name": "Do homework", "updates": {{"Due_Date": "Tomorrow"}}}}
@@ -238,19 +226,18 @@ def child_turn_node(state: AgentState) -> AgentState:
         messages_for_llm.append(HumanMessage(content=timmy_response_prompt))
 
         timmy_llm_response = llm.invoke(messages_for_llm)
-        print(f"DEBUG: Timmy LLM Raw Response: {timmy_llm_response.content}")
+        print(f"DEBUG: Timmy LLM Raw Response: {timmy_llm_response.content}") # Debug print
         timmy_content = timmy_llm_response.content
 
-        from datetime import datetime, timezone
-        timestamp = datetime.now(timezone.utc).isoformat()
-
-        add_message_to_history(chat_type, "Timmy", "Parent", timmy_content, timestamp)
-        state["messages"].append({"role": "assistant", "content": timmy_content})
+        new_timmy_message = {"role": "assistant", "content": timmy_content}
+        state["messages"].append(new_timmy_message) 
+        add_message_to_history(chat_type, "Timmy", "Timmy", timmy_content)
         state["current_speaker"] = "Timmy"
-
+        
     except Exception as e:
         timmy_content = "Uh oh, I'm not sure how to respond right now."
         state["messages"].append({"role": "assistant", "content": timmy_content})
+        add_message_to_history(chat_type, "Timmy", "Timmy", timmy_content)
         state["current_speaker"] = "Timmy"
 
     return state
@@ -258,45 +245,59 @@ def child_turn_node(state: AgentState) -> AgentState:
 
 def mrfrench_response_node(state: AgentState) -> AgentState:
     chat_type = state["chat_type"]
-    speaker = "Mr. French"
+    user_input = state["user_input"]
+    mr_french_task_action_response = state["mr_french_task_action_response"]
+    mr_french_analysis = state["mr_french_analysis"]["mr_french_analysis"]
+    
+    full_context_for_mrfrench = _get_full_context_for_llm(chat_type, [{"role": "user", "content": user_input}])
 
     if chat_type == "parent-mrfrench":
-        receiver = "Parent"
+        system_prompt_content = """You are Mr. French, a professional, courteous, and highly efficient AI assistant for parents.
+        Respond to the parent in a helpful, concise, and polite manner.
+        Acknowledge their requests clearly. If a task action (add/update/delete) was performed, confirm it professionally.
+        If it's a general query, respond appropriately without mentioning tasks unless relevant.
+        Avoid bullet points unless explicitly asked for a list. Keep messages concise, like a natural conversation."""
+        recipient = "Parent"
     elif chat_type == "timmy-mrfrench":
-        receiver = "Timmy"
-    elif chat_type == "parent-timmy":
-        receiver = "Parent"  # Mr. French narrating something back to Parent
+        system_prompt_content = """You are Mr. French, a kind, supportive, and encouraging AI assistant for children like Timmy.
+        Respond to Timmy in a friendly, gentle, and age-appropriate tone.
+        Praise him when he completes tasks, encourage him if he's struggling.
+        If he asks for advice, provide it kindly. Do not pressure him about tasks constantly."""
+        recipient = "Timmy"
     else:
-        receiver = "Unknown"
+        system_prompt_content = "You are Mr. French. Respond politely."
+        recipient = "None" 
 
-    mrfrench_content = state.get("mrfrench_task_action_response", "")
-    from datetime import datetime, timezone
-    timestamp = datetime.now(timezone.utc).isoformat()
+    mrfrench_system_prompt = SystemMessage(content=system_prompt_content)
+    
+    messages_for_llm = [mrfrench_system_prompt] + full_context_for_mrfrench
+    
+    if mr_french_analysis.get("intent") in ["ADD_TASK", "UPDATE_TASK", "DELETE_TASK"]:
+        instruction_message = f"You just analyzed the message and detected a task action. Your internal action response was: '{mr_french_task_action_response}'. Formulate a natural, conversational response based on this action and the user's original message: '{user_input}'."
+    elif mr_french_analysis.get("intent") in ["SET_TIMMY_ZONE_RED", "SET_TIMMY_ZONE_BLUE"]:
+        instruction_message = f"You just analyzed a request to set Timmy's zone. Your internal action response was: '{mr_french_task_action_response}'. Formulate a response regarding Timmy's zone."
+    else: 
+        instruction_message = f"The user's message '{user_input}' was general. Respond conversationally."
+
+    messages_for_llm.append(HumanMessage(content=instruction_message))
 
     try:
-        from datetime import datetime, timezone
-        timestamp = datetime.now(timezone.utc).isoformat()
+        mrfrench_llm_response = llm.invoke(messages_for_llm)
+        print(f"DEBUG: Mr. French Response LLM Raw Response: {mrfrench_llm_response.content}") # Debug print
+        mrfrench_content = mrfrench_llm_response.content
 
-        analysis = state.get("mrfrench_analysis", {})
-        user_input = state.get("user_input", "N/A")
-
-        if analysis:
-            log_message = json.dumps({
-                "chat_type": chat_type,
-                "original_input": user_input,
-                "analysis": analysis
-            }, indent=2)
-
-            add_message_to_history(
-                chat_type="mrfrench-logs",
-                sender="Mr. French",
-                receiver=receiver,
-                content=log_message,
-                timestamp=timestamp
-            )
+        new_mrfrench_message = {"role": "assistant", "content": mrfrench_content}
+        state["messages"].append(new_mrfrench_message) 
+        add_message_to_history(chat_type, "Mr. French", "Mr. French", mrfrench_content) 
+        state["current_speaker"] = "Mr. French"
+        state["recipient"] = recipient
 
     except Exception as e:
-        logger.warning(f"Failed to write to mrfrench-logs: {e}")
+        mrfrench_content = "I'm sorry, I'm having trouble responding right now."
+        state["messages"].append({"role": "assistant", "content": mrfrench_content})
+        add_message_to_history(chat_type, "Mr. French", "Mr. French", mrfrench_content)
+        state["current_speaker"] = "Mr. French"
+        state["recipient"] = recipient
 
     return state
 
