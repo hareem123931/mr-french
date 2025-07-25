@@ -39,6 +39,22 @@ def determine_roles(chat_type: str, user_type: str) -> tuple:
     else:
         return user_type, "Mr. French"
 
+def is_placeholder_message(content: str) -> bool:
+    """
+    Check if a message is just a placeholder (e.g., "Parent", "Mr. French", "Timmy")
+    """
+    if not content or not content.strip():
+        return True
+    
+    placeholder_texts = ["Parent", "Mr. French", "Timmy"]
+    return content.strip() in placeholder_texts
+
+def filter_placeholder_messages(history: list) -> list:
+    """
+    Filter out placeholder messages from chat history
+    """
+    return [msg for msg in history if not is_placeholder_message(msg.get("content", ""))]
+
 # Define an endpoint for the home page or health check
 @app.get("/")
 async def read_root():
@@ -62,6 +78,16 @@ async def chat_endpoint(
 
     if chat_type not in ["parent-timmy", "parent-mrfrench", "timmy-mrfrench"]:
         raise HTTPException(status_code=400, detail="Invalid chat_type. Must be 'parent-timmy', 'parent-mrfrench', or 'timmy-mrfrench'.")
+
+    # Skip processing if input is just a placeholder
+    if is_placeholder_message(user_input):
+        logger.info(f"Skipping placeholder message: '{user_input}'")
+        return {
+            "user_type": user_type,
+            "user_input": user_input,
+            "ai_response": "",
+            "message": "Placeholder message ignored"
+        }
 
     # Set current_speaker based on user_type
     current_speaker = user_type
@@ -122,18 +148,18 @@ async def chat_endpoint(
                     except Exception as db_e:
                         logger.error(f"Error during Supabase task update for '{original_task_name}': {db_e}", exc_info=True)
 
-        # Save the conversation to DB (add this before the return statement)
+        # Save the conversation to DB only if not placeholder messages
         try:
             user_role, ai_role = determine_roles(chat_type, user_type)
 
-            add_message_to_history(chat_type, user_input, user_role, user_type)
-            add_message_to_history(chat_type, response_message, ai_role, ai_role)
-
+            # Only save non-placeholder messages
+            if not is_placeholder_message(user_input):
+                add_message_to_history(chat_type, user_input, user_role, user_type)
+            if not is_placeholder_message(response_message):
+                add_message_to_history(chat_type, response_message, ai_role, ai_role)
 
         except Exception as save_e:
             logger.error(f"Failed to save chat history: {save_e}", exc_info=True)
-
-
 
         return {
             "user_type": user_type,
@@ -152,13 +178,15 @@ async def chat_endpoint(
 @app.get("/chat/{chat_type}/history")
 async def get_chat_history_endpoint(chat_type: str):
     """
-    Retrieves the full message history for a given chat type.
+    Retrieves the full message history for a given chat type, filtered to remove placeholder messages.
     """
     if chat_type not in ["parent-timmy", "parent-mrfrench", "timmy-mrfrench", "mrfrench-logs"]:
         raise HTTPException(status_code=400, detail="Invalid chat_type. Must be 'parent-timmy', 'parent-mrfrench', 'timmy-mrfrench', or 'mrfrench-logs'.")
     
     history = get_chat_history(chat_type, n_results=100)
-    return {"chat_type": chat_type, "history": history}
+    # Filter out placeholder messages
+    filtered_history = filter_placeholder_messages(history)
+    return {"chat_type": chat_type, "history": filtered_history}
 
 # --- Control & Monitoring Endpoints ---
 
