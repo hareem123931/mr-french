@@ -5,6 +5,7 @@ from pydantic import BaseModel
 import uvicorn
 import json
 import logging
+from fastapi import Path
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,6 +26,19 @@ class ChatInput(BaseModel):
 class TimmyZoneUpdate(BaseModel):
     zone: str
 
+def determine_roles(chat_type: str, user_type: str) -> tuple:
+    """
+    Returns a tuple (user_role, ai_role) based on chat_type and user_type
+    """
+    if chat_type == "timmy-mrfrench":
+        return "Timmy", "Mr. French"
+    elif chat_type == "parent-mrfrench":
+        return "Parent", "Mr. French"
+    elif chat_type == "parent-timmy":
+        return "Parent", "Timmy"
+    else:
+        return user_type, "Mr. French"
+
 # Define an endpoint for the home page or health check
 @app.get("/")
 async def read_root():
@@ -32,11 +46,13 @@ async def read_root():
 
 # --- Chat Endpoint (Unified) ---
 
-@app.post("/chat")
-async def chat_endpoint(chat_input: ChatInput):
+@app.post("/chat/{chat_type}")
+async def chat_endpoint(
+    chat_type: str = Path(..., regex="^(parent-timmy|parent-mrfrench|timmy-mrfrench)$"),
+    chat_input: ChatInput = ...
+):
     """
-    Handles conversational input for different chat types based on user_type.
-    Determines chat_type (parent-timmy, parent-mrfrench, timmy-mrfrench) based on speaker.
+    Handles conversational input for different chat types based on chat_type path parameter.
     """
     user_input = chat_input.user_input
     user_type = chat_input.user_type.capitalize() # Ensure 'Parent' or 'Timmy'
@@ -44,36 +60,13 @@ async def chat_endpoint(chat_input: ChatInput):
     if user_type not in ["Parent", "Timmy"]:
         raise HTTPException(status_code=400, detail="Invalid user_type. Must be 'Parent' or 'Timmy'.")
 
-    # Determine chat_type based on the conversation flow
-    # Assuming Mr. French's involvement implies a direct chat with him
-    # And if Parent talks and mentions Timmy or vice-versa, it's Parent-Timmy chat.
-    # This logic might need refinement based on your LangGraph's routing.
-    chat_type: str
-    current_speaker: str
-    
-    # Simple heuristic to determine chat type based on user_input and user_type
-    if "mr. french" in user_input.lower():
-        if user_type == "Parent":
-            chat_type = "parent-mrfrench"
-            current_speaker = "Parent"
-        else: # user_type == "Timmy"
-            chat_type = "timmy-mrfrench"
-            current_speaker = "Timmy"
-    elif user_type == "Parent":
-        # If Parent talks and doesn't explicitly mention Mr. French, assume Parent-Timmy
-        chat_type = "parent-timmy"
-        current_speaker = "Parent"
-    elif user_type == "Timmy":
-        # If Timmy talks and doesn't explicitly mention Mr. French, assume Timmy-MrFrench (as per client req 8, Timmy assigns via MrFrench)
-        # Or you might want to consider this as Timmy-Parent if that's a flow you need.
-        # For now, sticking to Timmy-MrFrench if Mr. French is the default recipient for Timmy.
-        chat_type = "timmy-mrfrench"
-        current_speaker = "Timmy"
-    else:
-        raise HTTPException(status_code=400, detail="Could not determine chat type based on user input and type.")
+    if chat_type not in ["parent-timmy", "parent-mrfrench", "timmy-mrfrench"]:
+        raise HTTPException(status_code=400, detail="Invalid chat_type. Must be 'parent-timmy', 'parent-mrfrench', or 'timmy-mrfrench'.")
 
+    # Set current_speaker based on user_type
+    current_speaker = user_type
 
-    logger.info(f"Received chat request: user_type='{user_type}', user_input='{user_input}', inferred_chat_type='{chat_type}'")
+    logger.info(f"Received chat request: user_type='{user_type}', user_input='{user_input}', chat_type='{chat_type}'")
 
     initial_state = {
         "chat_type": chat_type,
@@ -88,8 +81,6 @@ async def chat_endpoint(chat_input: ChatInput):
     try:
         final_state = None
         for s in langgraph_app.stream(initial_state, {'recursion_limit': 10}):
-            # This loop streams updates from the graph.
-            # The final_state will contain the complete state after execution.
             final_state = s
 
         if not final_state:
@@ -97,9 +88,7 @@ async def chat_endpoint(chat_input: ChatInput):
 
         response_message = "No direct AI response generated for this chat type."
         
-        # Extract the AI's response based on the final node of the flow
         if "mrfrench_response" in final_state:
-            # For Parent-MrFrench and Timmy-MrFrench direct responses
             messages_list = final_state["mrfrench_response"].get("messages", [])
             assistant_messages = [msg["content"] for msg in messages_list if msg.get("role") == "assistant"]
             if assistant_messages:
@@ -108,7 +97,6 @@ async def chat_endpoint(chat_input: ChatInput):
             else:
                 logger.warning("No assistant message found in mrfrench_response node.")
         elif "child_turn" in final_state:
-            # For Parent-Timmy flow where Timmy responds
             messages_list = final_state["child_turn"].get("messages", [])
             assistant_messages = [msg["content"] for msg in messages_list if msg.get("role") == "assistant"]
             if assistant_messages:
@@ -117,13 +105,9 @@ async def chat_endpoint(chat_input: ChatInput):
             else:
                 logger.warning("No assistant message found in child_turn node.")
         
-        # Log Mr. French's analysis if available (for observer mode or direct interaction)
         if final_state.get("mrfrench_analysis", {}).get("mr_french_analysis"):
             logger.info(f"Mr. French Analysis: {final_state['mrfrench_analysis']['mr_french_analysis']}")
             logger.info(f"Mr. French Task Action Response: {final_state['mrfrench_analysis']['mr_french_task_action_response']}")
-            
-            # --- DEBUGGING TASK COMPLETION ---
-            # Explicitly check for UPDATE_TASK intent and call update_task if needed
             analysis = final_state["mrfrench_analysis"]["mr_french_analysis"]
             if analysis.get("intent") == "UPDATE_TASK":
                 original_task_name = analysis.get("original_task_name")
@@ -131,9 +115,6 @@ async def chat_endpoint(chat_input: ChatInput):
                 if original_task_name and updates and updates.get("is_completed") == "Completed":
                     try:
                         logger.info(f"Attempting to update task '{original_task_name}' to 'Completed' in Supabase.")
-                        # Call update_task explicitly here if your LangGraph doesn't handle it
-                        # Make sure your update_task function in supabase_service can handle this
-                        # If your LangGraph node already calls it, this might be redundant or for debug validation.
                         updated_task_db_response = update_task(original_task_name, updates)
                         logger.info(f"Supabase update_task response: {updated_task_db_response}")
                         if not updated_task_db_response:
@@ -141,14 +122,24 @@ async def chat_endpoint(chat_input: ChatInput):
                     except Exception as db_e:
                         logger.error(f"Error during Supabase task update for '{original_task_name}': {db_e}", exc_info=True)
 
+        # Save the conversation to DB (add this before the return statement)
+        try:
+            user_role, ai_role = determine_roles(chat_type, user_type)
+
+            add_message_to_history(chat_type, message_content=user_input, role=user_role, sender=user_type)
+            add_message_to_history(chat_type, message_content=response_message, role=ai_role, sender=ai_role)
+
+        except Exception as save_e:
+            logger.error(f"Failed to save chat history: {save_e}", exc_info=True)
+
+
 
         return {
-            "chat_type": chat_type,
             "user_type": user_type,
             "user_input": user_input,
             "ai_response": response_message,
             "final_state_summary": {
-                k: v for k, v in final_state.items() if k not in ["messages"] # Avoid returning full message list if it's large
+                k: v for k, v in final_state.items() if k not in ["messages"]
             }
         }
 
